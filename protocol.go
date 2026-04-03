@@ -158,6 +158,8 @@ const (
 )
 
 // ReadAuthRequest 读取并解析客户端的认证请求（安全版：添加 DoS 防护）
+// 参数 r: IO 读取器
+// 返回：认证请求对象和可能的错误
 func ReadAuthRequest(r io.Reader) (*AuthRequest, error) {
 	req := &AuthRequest{}
 
@@ -191,6 +193,8 @@ func ReadAuthRequest(r io.Reader) (*AuthRequest, error) {
 }
 
 // WriteAuthResponse 向客户端写入认证响应
+// 参数 w: IO 写入器；method: 选定的认证方法
+// 返回：可能的错误
 func WriteAuthResponse(w io.Writer, method byte) error {
 	resp := &AuthResponse{
 		Version: Version,
@@ -200,6 +204,8 @@ func WriteAuthResponse(w io.Writer, method byte) error {
 }
 
 // ReadPasswordAuthRequest 读取并解析客户端的密码认证请求（安全版：添加长度验证）
+// 参数 r: IO 读取器
+// 返回：密码认证请求对象和可能的错误
 func ReadPasswordAuthRequest(r io.Reader) (*PasswordAuthRequest, error) {
 	req := &PasswordAuthRequest{}
 
@@ -251,6 +257,8 @@ func ReadPasswordAuthRequest(r io.Reader) (*PasswordAuthRequest, error) {
 }
 
 // WritePasswordAuthResponse 向客户端写入密码认证响应
+// 参数 w: IO 写入器；status: 认证状态（0x00 成功，0x01 失败）
+// 返回：可能的错误
 func WritePasswordAuthResponse(w io.Writer, status byte) error {
 	resp := &PasswordAuthResponse{
 		Version: 0x01,
@@ -260,6 +268,8 @@ func WritePasswordAuthResponse(w io.Writer, status byte) error {
 }
 
 // ReadRequest 读取并解析客户端的 SOCKS5 请求
+// 参数 r: IO 读取器
+// 返回：SOCKS5 请求对象和可能的错误
 func ReadRequest(r io.Reader) (*Request, error) {
 	req := &Request{}
 
@@ -331,6 +341,8 @@ func ReadRequest(r io.Reader) (*Request, error) {
 }
 
 // WriteResponse 向客户端写入 SOCKS5 响应
+// 参数 w: IO 写入器；rep: 回复码；addrType: 地址类型；bndAddr: 绑定地址；bndPort: 绑定端口
+// 返回：可能的错误
 func WriteResponse(w io.Writer, rep byte, addrType byte, bndAddr string, bndPort uint16) error {
 	resp := &Response{
 		Version:  Version,  // SOCKS5 版本
@@ -393,6 +405,8 @@ func WriteResponse(w io.Writer, rep byte, addrType byte, bndAddr string, bndPort
 }
 
 // ParseUDPHeader 解析 UDP 数据包头部
+// 参数 data: UDP 数据包字节数组
+// 返回：UDP 头部对象和可能的错误
 func ParseUDPHeader(data []byte) (*UDPHeader, error) {
 	// UDP 头部至少需要 10 字节
 	if len(data) < 10 {
@@ -461,6 +475,8 @@ func ParseUDPHeader(data []byte) (*UDPHeader, error) {
 }
 
 // BuildUDPHeader 构建 UDP 数据包头部
+// 参数 addrType: 地址类型；dstAddr: 目标地址；dstPort: 目标端口；data: 实际数据
+// 返回：构建的 UDP 数据包字节数组和可能的错误
 func BuildUDPHeader(addrType byte, dstAddr string, dstPort uint16, data []byte) ([]byte, error) {
 	buf := make([]byte, 0, 1024) // 预分配容量的缓冲区
 

@@ -8,16 +8,17 @@
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: Arial, sans-serif; background: #f5f5f5; }
         .header { background: #2c3e50; color: white; padding: 20px; text-align: center; }
-        .container { max-width: 1200px; margin: 20px auto; padding: 20px; }
+        .container { max-width: 1400px; margin: 20px auto; padding: 20px; }
         .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         .card h2 { color: #2c3e50; margin-bottom: 15px; }
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
         .stat-item { background: #3498db; color: white; padding: 20px; border-radius: 8px; text-align: center; }
         .stat-item h3 { font-size: 2em; margin: 10px 0; }
-        .btn { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin: 5px; }
+        .btn { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin: 5px; text-decoration: none; display: inline-block; }
         .btn:hover { background: #2980b9; }
         .btn-danger { background: #e74c3c; }
         .btn-success { background: #27ae60; }
+        .btn-warning { background: #f39c12; }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
         th { background: #f8f9fa; font-weight: bold; }
@@ -25,82 +26,110 @@
         .form-group { margin-bottom: 15px; }
         .form-group label { display: block; margin-bottom: 5px; font-weight: bold; }
         .form-group input, .form-group select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
-        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; }
-        .modal-content { background: white; margin: 5% auto; padding: 30px; border-radius: 8px; max-width: 500px; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; overflow-y: auto; }
+        .modal-content { background: white; margin: 5% auto; padding: 30px; border-radius: 8px; max-width: 500px; max-height: 80vh; overflow-y: auto; }
         .close { float: right; font-size: 28px; cursor: pointer; }
+        
+        /* 导航栏样式 */
+        .nav-bar { background: white; padding: 15px 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .nav-bar a { color: #2c3e50; text-decoration: none; margin-right: 20px; padding: 8px 15px; border-radius: 4px; transition: background 0.3s; }
+        .nav-bar a:hover { background: #3498db; color: white; }
+        .nav-bar a.active { background: #3498db; color: white; }
+        
+        .user-info { display: flex; justify-content: space-between; align-items: center; background: #f8f9fa; padding: 10px 20px; border-radius: 8px; margin-bottom: 20px; }
+        .user-info span { color: #666; }
+        .logout-btn { background: #e74c3c; padding: 5px 15px; font-size: 14px; }
+        
+        /* 模态框优化样式 */
+        .modal-footer { margin-top: 20px; padding-top: 20px; border-top: 2px solid #eee; text-align: right; }
+        .modal-content form { margin-bottom: 0; }
+        .form-group:last-of-type { margin-bottom: 10px; }
+        
+        /* 响应式优化 */
+        @media (max-width: 768px) {
+            .modal-content { margin: 10% auto; padding: 20px; max-width: 95%; }
+            .header h1 { font-size: 1.5em; }
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .nav-bar { padding: 10px; }
+            .nav-bar a { display: block; margin-bottom: 10px; }
+        }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>🚀 SOCKS5 代理管理面板</h1>
-    </div>
-    
-    <div class="container">
-        <!-- 统计卡片 -->
-        <div class="card">
-            <h2>📊 实时统计</h2>
-            <div class="stats-grid" id="statsGrid">
-                <div class="stat-item">
-                    <h3 id="totalUsers">-</h3>
-                    <p>总用户数</p>
-                </div>
-                <div class="stat-item">
-                    <h3 id="activeUsers">-</h3>
-                    <p>活跃用户</p>
-                </div>
-                <div class="stat-item">
-                    <h3 id="totalUpload">-</h3>
-                    <p>总上传</p>
-                </div>
-                <div class="stat-item">
-                    <h3 id="totalDownload">-</h3>
-                    <p>总下载</p>
+    <!-- 主页面 -->
+    <div id="mainPage">
+        <div class="header">
+            <h1>🚀 SOCKS5 代理管理面板</h1>
+        </div>
+        
+        <div class="container">
+            <!-- 导航栏 -->
+            <div class="nav-bar">
+                <a href="/index.html" class="active">🏠 主页</a>
+                <a href="/quota.html">📊 流量配额</a>
+            </div>
+            
+            <!-- 用户信息栏 -->
+            <div class="user-info">
+                <span>欢迎，<strong id="currentUsername">管理员</strong></span>
+                <div>
+                    <button class="btn btn-warning" onclick="showChangePasswordModal()">🔑 修改密码</button>
+                    <button class="btn btn-warning" onclick="showAuthMethodModal()">🔐 认证方式</button>
+                    <button class="btn btn-warning" onclick="showConfigModal()">⚙️ 服务器配置</button>
+                    <button class="btn btn-danger logout-btn" onclick="logout()">🚪 退出登录</button>
                 </div>
             </div>
-        </div>
-        
-        <!-- 用户管理 -->
-        <div class="card">
-            <h2>👥 用户管理 
-                <button class="btn btn-success" onclick="showAddUserModal()">添加用户</button>
-            </h2>
-            <table id="usersTable">
-                <thead>
-                    <tr>
-                        <th>用户名</th>
-                        <th>分组</th>
-                        <th>上传限速</th>
-                        <th>下载限速</th>
-                        <th>连接数</th>
-                        <th>IP 连接数</th>
-                        <th>流量配额</th>
-                        <th>状态</th>
-                        <th>操作</th>
-                    </tr>
-                </thead>
-                <tbody id="usersTableBody"></tbody>
-            </table>
-        </div>
-        
-        <!-- 分组管理 -->
-        <div class="card">
-            <h2>📁 分组管理 
-                <button class="btn btn-success" onclick="showAddGroupModal()">添加分组</button>
-            </h2>
-            <table id="groupsTable">
-                <thead>
-                    <tr>
-                        <th>分组名</th>
-                        <th>描述</th>
-                        <th>上传限速</th>
-                        <th>下载限速</th>
-                        <th>最大连接数</th>
-                        <th>成员数</th>
-                        <th>操作</th>
-                    </tr>
-                </thead>
-                <tbody id="groupsTableBody"></tbody>
-            </table>
+            
+            <!-- 导航栏 -->
+            <div class="card" style="padding: 10px 20px;">
+                <a href="/quota.html" class="btn" style="text-decoration: none; display: inline-block;">📊 流量配额管理</a>
+                <span style="color: #999; margin: 0 10px;">|</span>
+                <span style="color: #666;">当前页面：用户管理</span>
+            </div>
+            
+            <!-- 统计卡片 -->
+            <div class="card">
+                <h2>📊 实时统计</h2>
+                <div class="stats-grid" id="statsGrid">
+                    <div class="stat-item">
+                        <h3 id="totalUsers">-</h3>
+                        <p>总用户数</p>
+                    </div>
+                    <div class="stat-item">
+                        <h3 id="activeUsers">-</h3>
+                        <p>活跃用户</p>
+                    </div>
+                    <div class="stat-item">
+                        <h3 id="totalUpload">-</h3>
+                        <p>总上传</p>
+                    </div>
+                    <div class="stat-item">
+                        <h3 id="totalDownload">-</h3>
+                        <p>总下载</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 用户管理 -->
+            <div class="card">
+                <h2>👥 用户管理 
+                    <button class="btn btn-success" onclick="showAddUserModal()">添加用户</button>
+                </h2>
+                <table id="usersTable">
+                    <thead>
+                        <tr>
+                            <th>用户名</th>
+                            <th>上传限速</th>
+                            <th>下载限速</th>
+                            <th>连接数</th>
+                            <th>最大登录设备</th>
+                            <th>状态</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="usersTableBody"></tbody>
+                </table>
+            </div>
         </div>
     </div>
     
@@ -121,10 +150,6 @@
                     <small style="color: #666;">留空则不修改密码</small>
                 </div>
                 <div class="form-group">
-                    <label>分组</label>
-                    <select id="group"></select>
-                </div>
-                <div class="form-group">
                     <label>上传限速 (字节/秒，0 不限)</label>
                     <input type="number" id="readLimit" value="0">
                 </div>
@@ -137,31 +162,13 @@
                     <input type="number" id="maxConn" value="0">
                 </div>
                 <div class="form-group">
-                    <label>单用户最大 IP 连接数 (0 不限)</label>
+                    <label>单用户最大登录设备 (0 不限)</label>
                     <input type="number" id="maxIPConnections" value="0">
                 </div>
-                <hr style="margin: 20px 0; border: none; border-top: 1px solid #ddd;">
-                <div class="form-group">
-                    <label>流量配额周期</label>
-                    <select id="quotaPeriod">
-                        <option value="">无限制</option>
-                        <option value="daily">每日</option>
-                        <option value="weekly">每周</option>
-                        <option value="monthly">每月</option>
-                    </select>
+                <div class="modal-footer">
+                    <button type="button" class="btn" onclick="closeModal('addUserModal')">取消</button>
+                    <button type="submit" class="btn btn-success">保存</button>
                 </div>
-                <div class="form-group">
-                    <label>周期流量配额 (MB，0 不限)</label>
-                    <input type="number" id="quotaBytes" value="0" min="0">
-                    <small style="color: #666;">设置周期内允许使用的总流量</small>
-                </div>
-                <div class="form-group">
-                    <label>当前周期已用流量</label>
-                    <div id="quotaUsed" style="padding: 8px; background: #f5f5f5; border-radius: 4px;">
-                        <span style="color: #666;">未设置配额</span>
-                    </div>
-                </div>
-                <button type="submit" class="btn btn-success">保存</button>
             </form>
         </div>
     </div>
@@ -193,11 +200,131 @@
                     <label>最大连接数 (0 不限)</label>
                     <input type="number" id="groupMaxConn" value="0">
                 </div>
-                <button type="submit" class="btn btn-success">保存</button>
+                <div class="form-group">
+                    <label>分组流量配额 (MB，0 不限)</label>
+                    <input type="number" id="groupTrafficQuota" value="0" min="0">
+                    <small style="color: #666;">组内成员共享该流量配额</small>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="groupTrafficQuotaEnabled">
+                        启用分组流量配额
+                    </label>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn" onclick="closeModal('addGroupModal')">取消</button>
+                    <button type="submit" class="btn btn-success">保存</button>
+                </div>
             </form>
         </div>
     </div>
     
-    <script src="/static/app.js"></script>
+    <!-- 修改密码模态框 -->
+    <div id="changePasswordModal" class="modal">
+        <div class="modal-content" style="max-width: 400px;">
+            <span class="close" onclick="closeModal('changePasswordModal')">&times;</span>
+            <h2 style="margin-bottom: 20px;">🔑 修改密码</h2>
+            <form id="changePasswordForm">
+                <div class="form-group">
+                    <label>原密码</label>
+                    <input type="password" id="oldPassword" required placeholder="请输入原密码">
+                </div>
+                <div class="form-group">
+                    <label>新密码</label>
+                    <input type="password" id="newPassword" required placeholder="请输入新密码（至少 6 位）" minlength="6">
+                </div>
+                <div class="form-group">
+                    <label>确认新密码</label>
+                    <input type="password" id="confirmPassword" required placeholder="请再次输入新密码">
+                </div>
+                <div id="changePasswordError" class="error" style="margin-bottom: 15px;"></div>
+                <div class="modal-footer">
+                    <button type="button" class="btn" onclick="closeModal('changePasswordModal')">取消</button>
+                    <button type="submit" class="btn btn-success">确定</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- 认证方式模态框 -->
+    <div id="authMethodModal" class="modal">
+        <div class="modal-content" style="max-width: 500px;">
+            <span class="close" onclick="closeModal('authMethodModal')">&times;</span>
+            <h2 style="margin-bottom: 20px;">🔐 认证方式设置</h2>
+            <div style="padding: 20px 0;">
+                <p style="margin-bottom: 20px; color: #666;">选择 SOCKS5 代理的验证方式：</p>
+                <div style="display: flex; flex-direction: column; gap: 15px;">
+                    <label style="display: flex; align-items: center; padding: 15px; border: 2px solid #3498db; border-radius: 8px; cursor: pointer; background: #e8f4f8;">
+                        <input type="radio" name="authMethod" value="password" style="margin-right: 10px; width: 20px; height: 20px;">
+                        <div>
+                            <strong style="font-size: 16px;">🔑 密码认证</strong>
+                            <p style="margin: 5px 0 0 0; font-size: 14px; color: #666;">需要用户名和密码验证（推荐）</p>
+                        </div>
+                    </label>
+                    <label style="display: flex; align-items: center; padding: 15px; border: 2px solid #95a5a6; border-radius: 8px; cursor: pointer; background: #f8f9fa;">
+                        <input type="radio" name="authMethod" value="none" style="margin-right: 10px; width: 20px; height: 20px;">
+                        <div>
+                            <strong style="font-size: 16px;">⚠️ 无认证</strong>
+                            <p style="margin: 5px 0 0 0; font-size: 14px; color: #666;">无需验证直接连接（不安全，仅测试使用）</p>
+                        </div>
+                    </label>
+                </div>
+                <div id="authMethodWarning" class="error" style="margin-top: 15px; display: none;"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn" onclick="closeModal('authMethodModal')">取消</button>
+                <button type="button" class="btn btn-success" onclick="saveAuthMethod()">保存设置</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 服务器配置模态框 -->
+    <div id="configModal" class="modal">
+        <div class="modal-content" style="max-width: 800px;">
+            <span class="close" onclick="closeModal('configModal')">&times;</span>
+            <h2 style="margin-bottom: 20px;">⚙️ 服务器配置</h2>
+            <form id="configForm">
+                <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
+                    <div class="form-group">
+                        <label>📍 监听地址</label>
+                        <input type="text" id="configListenAddr" placeholder="0.0.0.0:1080">
+                        <small style="color: #666;">服务器监听地址和端口</small>
+                    </div>
+                    <div class="form-group">
+                        <label>👥 最大工作协程数</label>
+                        <input type="number" id="configMaxWorkers" placeholder="0=无限制">
+                        <small style="color: #666;">0 表示由系统决定</small>
+                    </div>
+                    <div class="form-group">
+                        <label>🔗 单 IP 最大连接数</label>
+                        <input type="number" id="configMaxConnPerIP" placeholder="100000">
+                        <small style="color: #666;">限制每个 IP 的最大连接数</small>
+                    </div>
+                    <div class="form-group">
+                        <label>📤 上传速度限制 (字节/秒)</label>
+                        <input type="number" id="configReadSpeedLimit" placeholder="0=不限速">
+                        <small style="color: #666;">0 表示不限制</small>
+                    </div>
+                    <div class="form-group">
+                        <label>📥 下载速度限制 (字节/秒)</label>
+                        <input type="number" id="configWriteSpeedLimit" placeholder="0=不限速">
+                        <small style="color: #666;">0 表示不限制</small>
+                    </div>
+                    <div class="form-group">
+                        <label>💓 TCP Keepalive 周期 (秒)</label>
+                        <input type="number" id="configTCPKeepAlive" placeholder="15">
+                        <small style="color: #666;">TCP 心跳检测周期</small>
+                    </div>
+                </div>
+                <div id="configMessage" style="margin-top: 15px;"></div>
+                <div class="modal-footer" style="margin-top: 20px;">
+                    <button type="button" class="btn" onclick="closeModal('configModal')">取消</button>
+                    <button type="button" class="btn btn-success" onclick="saveConfig()">保存配置</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <script src="/static/app.js?v=20260320"></script>
 </body>
 </html>

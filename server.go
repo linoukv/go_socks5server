@@ -1,65 +1,93 @@
+// =============================================================================
+// 文件名：server.go
+// 描述：SOCKS5 代理服务器核心实现文件
+// 功能：服务器启动、连接处理、认证协商、请求分发、TCP/UDP 代理
+// 性能优化：万兆网络优化（16MB TCP 缓冲区、缓冲池复用、原子操作统计）
+// =============================================================================
+
 package main
 
 import (
-	"context" // 上下文控制
-	"fmt"     // 格式化输出
-	"io"      // IO 操作
-	"log"     // 日志记录
-	"net"     // 网络操作
-	"runtime" // 运行时信息
-	"strings"
-	"sync"        // 同步原语
-	"sync/atomic" // 原子操作
-	"time"        // 时间处理
+	"context"     // 上下文控制包（用于优雅关闭）
+	"fmt"         // 格式化输出包
+	"io"          // IO 操作包（数据复制）
+	"log"         // 日志记录包
+	"net"         // 网络操作包（TCP/UDP 连接）
+	"runtime"     // 运行时信息包（获取 CPU 核心数）
+	"strings"     // 字符串处理包（错误类型判断）
+	"sync"        // 同步原语包（互斥锁、等待组）
+	"sync/atomic" // 原子操作包（无锁并发计数）
+	"time"        // 时间处理包（超时控制）
 )
 
-// Config 服务器配置结构体
+// =============================================================================
+// Config - SOCKS5 服务器配置结构体
+//
+// 包含所有可配置的参数，支持从数据库加载和用户自定义设置
+// 默认配置通过 DefaultConfig() 函数提供（万兆性能优化版）
+// =============================================================================
 type Config struct {
-	// 监听地址：服务器监听的 IP 和端口
+	// --- 限速配置（int64 字段必须放在开头，确保 8 字节对齐）---
+	// 读取速度限制（上传方向：客户端->服务器），单位：字节/秒，0 表示不限速
+	ReadSpeedLimit int64
+	// 写入速度限制（下载方向：服务器->客户端），单位：字节/秒，0 表示不限速
+	WriteSpeedLimit int64
+
+	// --- 基础配置 ---
+	// 监听地址：格式为 "IP:端口"，示例："0.0.0.0:1080" 或 "127.0.0.1:1080"
 	ListenAddr string
 
-	// 认证配置：认证器接口实现
+	// 认证器接口：实现 Authenticator 接口的对象，用于用户认证
+	// 可选实现：*NoAuth（无认证）、*PasswordAuth（密码认证）
 	Auth Authenticator
 
-	// 并发配置
-	MaxWorkers   int // 最大工作 goroutine 数，0 表示无限制
-	MaxConnPerIP int // 每个 IP 最大连接数，0 表示无限制
+	// --- 并发控制配置 ---
+	// 最大工作协程数：0 表示无限制，由 GOMAXPROCS 自动调度（推荐）
+	// 说明：设置具体数值可以限制最大并发，但可能影响性能
+	MaxWorkers int
 
-	// 限速配置（字节/秒），0 表示不限速
-	ReadSpeedLimit  int64 // 读取速度限制（上传）
-	WriteSpeedLimit int64 // 写入速度限制（下载）
+	// 单 IP 最大连接数：防止单个 IP 占用过多资源，0 表示无限制
+	// 默认值：200000（超高并发优化）
+	MaxConnPerIP int
 
-	// 多用户管理配置
-	EnableUserManagement bool // 是否启用多用户管理
+	// --- 多用户管理配置 ---
+	// 是否启用多用户管理：true=需要认证，false=无认证模式
+	EnableUserManagement bool
 
-	// 超时配置
-	HandshakeTimeout time.Duration // 握手超时时间
-	IdleTimeout      time.Duration // 空闲连接超时时间
+	// --- 超时配置 ---
+	// 握手超时时间：客户端必须在指定时间内完成认证，否则断开连接
+	// 默认值：10 秒（快速释放资源）
+	HandshakeTimeout time.Duration
 
-	// UDP 配置
-	UDPTimeout time.Duration // UDP 关联超时时间
+	// --- 性能优化配置 ---
+	// TCP Keepalive 心跳周期：发送心跳包检测死连接的间隔
+	// 默认值：5 秒（更快检测死连接，及时释放资源）
+	TCPKeepAlivePeriod time.Duration
 
-	// 性能优化配置
-	TCPKeepAlivePeriod time.Duration // TCP Keepalive 心跳周期
-	TCPNoDelay         bool          // 是否禁用 Nagle 算法（true 减少延迟）
-	RecvBufferPool     *BufferPool   // 接收缓冲区池，减少内存分配
-	SendBufferPool     *BufferPool   // 发送缓冲区池，减少内存分配
+	// 是否禁用 Nagle 算法：true=禁用（减少传输延迟），false=启用（合并小包）
+	// 说明：禁用后可以立即发送数据，适合实时性要求高的场景
+	TCPNoDelay bool
+
+	// 接收缓冲区池：预分配的缓冲区池，减少内存分配和 GC 压力
+	// 默认值：2MB（万兆优化，提升大流量吞吐性能）
+	RecvBufferPool *BufferPool
+
+	// 发送缓冲区池：用于发送数据的缓冲区池
+	SendBufferPool *BufferPool
 }
 
-// DefaultConfig 返回默认配置参数（优化版）
+// DefaultConfig 返回默认配置参数（万兆性能优化版）
 func DefaultConfig() *Config {
 	return &Config{
-		ListenAddr:         "0.0.0.0:1080",           // 默认监听所有网卡的 1080 端口
-		Auth:               &NoAuth{},                // 默认无认证
-		MaxWorkers:         0,                        // 默认无限制（让 GOMAXPROCS 决定）
-		MaxConnPerIP:       10000,                    // 默认单 IP 最多 10000 连接（超高并发）
-		HandshakeTimeout:   10 * time.Second,         // 握手超时 10 秒
-		IdleTimeout:        300 * time.Second,        // 空闲超时 300 秒
-		UDPTimeout:         300 * time.Second,        // UDP 超时 300 秒
-		TCPKeepAlivePeriod: 30 * time.Second,         // 启用 TCP Keepalive，30 秒一次
-		TCPNoDelay:         true,                     // 禁用 Nagle 算法，减少传输延迟
-		RecvBufferPool:     NewBufferPool(64 * 1024), // 接收缓冲区池 64KB
-		SendBufferPool:     NewBufferPool(64 * 1024), // 发送缓冲区池 64KB
+		ListenAddr:         "0.0.0.0:1080",                 // 默认监听所有网卡的 1080 端口
+		Auth:               &NoAuth{},                      // 默认无认证
+		MaxWorkers:         0,                              // 默认无限制（让 GOMAXPROCS 决定）
+		MaxConnPerIP:       200000,                         // 默认单 IP 最多 200000 连接（万兆超高并发优化）
+		HandshakeTimeout:   10 * time.Second,               // 握手超时 10 秒（更快释放资源）
+		TCPKeepAlivePeriod: 15 * time.Second,               // TCP Keepalive，15 秒一次
+		TCPNoDelay:         true,                           // 禁用 Nagle 算法，减少传输延迟
+		RecvBufferPool:     NewBufferPool(2 * 1024 * 1024), // 接收缓冲区池 2MB（万兆优化）
+		SendBufferPool:     NewBufferPool(2 * 1024 * 1024), // 发送缓冲区池 2MB
 	}
 }
 
@@ -80,6 +108,10 @@ type Server struct {
 
 	// 性能优化：预分配的零拷贝缓冲区（用于小数据包）
 	zeroBuf []byte // 512 字节零拷贝缓冲区，用于小响应
+
+	// 多用户管理：连接地址到用户名的映射
+	connUserMap map[string]string // {clientIP:port: username}
+	connUserMu  sync.RWMutex      // 保护 connUserMap 的锁
 }
 
 // NewServer 创建并初始化新的 SOCKS5 服务器实例（优化版）
@@ -105,6 +137,7 @@ func NewServer(config *Config) *Server {
 		ctx:         ctx,                                 // 上下文
 		cancel:      cancel,                              // 取消函数
 		zeroBuf:     make([]byte, 512),                   // 预分配小缓冲区，减少小对象 GC
+		connUserMap: make(map[string]string),             // 初始化连接 - 用户映射
 	}
 }
 
@@ -133,6 +166,11 @@ func (s *Server) Start() error {
 	// 启动统计打印 goroutine，定期输出服务器状态
 	go s.statsReporter()
 
+	// 启动用户数据持久化 goroutine（每 10 秒保存一次）
+	if s.config.EnableUserManagement {
+		go s.userDataPersister()
+	}
+
 	// 主循环：接受客户端连接
 	for atomic.LoadInt32(&s.running) == 1 {
 		conn, err := listener.Accept() // 阻塞等待新连接
@@ -146,20 +184,23 @@ func (s *Server) Start() error {
 			}
 		}
 
-		// 优化 TCP 连接参数以提高性能（优化版）
+		// 万兆优化：TCP 连接参数（16MB 缓冲区实现万兆吞吐）
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			// 设置 TCP_NODELAY 禁用 Nagle 算法，减少延迟
 			if s.config.TCPNoDelay {
 				tcpConn.SetNoDelay(true)
 			}
-			// 设置 TCP_KEEPALIVE 检测死连接
+			// 设置 TCP_KEEPALIVE 检测死连接（更短周期）
 			if s.config.TCPKeepAlivePeriod > 0 {
 				tcpConn.SetKeepAlive(true)
 				tcpConn.SetKeepAlivePeriod(s.config.TCPKeepAlivePeriod)
 			}
-			// 设置更大的缓冲区以提高吞吐量
-			tcpConn.SetReadBuffer(64 * 1024)  // 64KB 读缓冲区
-			tcpConn.SetWriteBuffer(64 * 1024) // 64KB 写缓冲区
+			// 万兆优化：16MB 缓冲区（关键优化：10Gbps 必需）
+			tcpConn.SetReadBuffer(16 * 1024 * 1024)  // 16MB 读缓冲区
+			tcpConn.SetWriteBuffer(16 * 1024 * 1024) // 16MB 写缓冲区
+			// 启用 TCP_FASTOPEN（如果系统支持）
+			// 注意：Windows 需要 TCP_FASTOPEN 支持，Linux 需要内核 4.11+
+			_ = tcpConn // 占位符，实际 FASTOPEN 需要平台特定代码
 		}
 
 		// 检查 IP 连接数限制，防止单 IP 占用过多资源
@@ -214,7 +255,13 @@ func (s *Server) IsRunning() bool {
 
 // handleConnection 处理单个客户端连接的完整流程
 func (s *Server) handleConnection(conn net.Conn) {
-	defer conn.Close() // 确保连接最终关闭
+	defer func() {
+		// 清理连接映射中的用户信息
+		s.connUserMu.Lock()
+		delete(s.connUserMap, conn.RemoteAddr().String())
+		s.connUserMu.Unlock()
+		conn.Close() // 确保连接最终关闭
+	}()
 
 	// 从池中获取缓冲区，减少内存分配开销
 	buf := s.bufferPool.Get()
@@ -232,7 +279,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	// 第二步：处理 SOCKS5 请求
 	if err := s.handleRequest(conn); err != nil {
-		log.Printf("请求处理失败来自 %s：%v", conn.RemoteAddr(), err)
+
 		// 只统计真正的失败（排除 DNS 和连接目标服务器失败）
 		if !isDNSError(err) && !isConnectionError(err) {
 			s.stats.AddFailedConnection()
@@ -310,6 +357,10 @@ func (s *Server) handlePasswordAuth(conn net.Conn) error {
 			// 增加用户连接数和 IP 记录
 			auth.IncrementUserConnection(req.Uname)
 			auth.AddUserIP(req.Uname, clientIP)
+			// 记录连接地址到用户名的映射，用于后续识别用户
+			s.connUserMu.Lock()
+			s.connUserMap[conn.RemoteAddr().String()] = req.Uname
+			s.connUserMu.Unlock()
 		}
 	}
 
@@ -329,12 +380,8 @@ func (s *Server) handleRequest(conn net.Conn) error {
 		return fmt.Errorf("读取请求：%w", err)
 	}
 
-	// 清除握手超时，设置空闲超时（长连接）
-	if s.config.IdleTimeout > 0 {
-		conn.SetDeadline(time.Now().Add(s.config.IdleTimeout))
-	} else {
-		conn.SetDeadline(time.Time{}) // 无限等待
-	}
+	// 清除握手超时，设置连接为永久阻塞（禁用空闲超时）
+	conn.SetDeadline(time.Time{}) // 无限等待
 
 	// 根据命令类型分发处理
 	switch req.Cmd {
@@ -356,17 +403,22 @@ func (s *Server) handleConnect(conn net.Conn, req *Request) error {
 	proxy := NewTCPProxy(conn, s)
 	proxy.SetBufferPool(s.bufferPool) // 传递缓冲区池以减少内存分配
 
-	// 如果启用了多用户管理，从认证器获取当前用户名（通过连接地址查找）
+	// 如果启用了多用户管理，从认证器获取当前用户名
 	if s.config.EnableUserManagement {
 		if auth, ok := s.config.Auth.(*PasswordAuth); ok {
-			// 这里简化处理，假设最近认证的用户就是当前连接的用户
-			// 实际生产中应该使用 connection context 来跟踪
-			for _, user := range auth.ListUsers() {
-				if auth.GetUserConnectionCount(user.Username) > 0 {
-					// 找到有活动连接的用户，设置为当前用户
-					proxy.SetUsername(user.Username)
-					break
-				}
+			// 优先从连接映射中获取用户名（快速路径）
+			s.connUserMu.RLock()
+			username, exists := s.connUserMap[conn.RemoteAddr().String()]
+			s.connUserMu.RUnlock()
+
+			// 如果映射中不存在，尝试从 IP 映射中查找（容错路径）
+			if !exists {
+				clientIP := getClientIP(conn)
+				username, exists = auth.FindUserByIP(clientIP)
+			}
+
+			if exists {
+				proxy.SetUsername(username)
 			}
 		}
 	}
@@ -386,18 +438,25 @@ func (s *Server) handleBind(conn net.Conn, req *Request) error {
 func (s *Server) handleUDPAssociate(conn net.Conn, req *Request) error {
 	// 创建 UDP 关联对象
 	udpAssoc := NewUDPAssociation(conn, s)
-	udpAssoc.timeout = s.config.UDPTimeout // 设置超时时间
-	s.stats.AddUDPAssociation()            // 更新统计
+	s.stats.AddUDPAssociation() // 更新统计
 	defer s.stats.RemoveUDPAssociation()
 
 	// 如果启用了多用户管理，从认证器获取当前用户名
 	if s.config.EnableUserManagement {
 		if auth, ok := s.config.Auth.(*PasswordAuth); ok {
-			for _, user := range auth.ListUsers() {
-				if auth.GetUserConnectionCount(user.Username) > 0 {
-					udpAssoc.SetUsername(user.Username)
-					break
-				}
+			// 优先从连接映射中获取用户名（快速路径）
+			s.connUserMu.RLock()
+			username, exists := s.connUserMap[conn.RemoteAddr().String()]
+			s.connUserMu.RUnlock()
+
+			// 如果映射中不存在，尝试从 IP 映射中查找（容错路径）
+			if !exists {
+				clientIP := getClientIP(conn)
+				username, exists = auth.FindUserByIP(clientIP)
+			}
+
+			if exists {
+				udpAssoc.SetUsername(username)
 			}
 		}
 	}
@@ -429,6 +488,8 @@ func (s *Server) GetStats() *Stats {
 }
 
 // getClientIP 从连接中提取客户端 IP 地址
+// 参数 conn: 网络连接对象
+// 返回：客户端 IP 地址字符串
 func getClientIP(conn net.Conn) string {
 	addr, ok := conn.RemoteAddr().(*net.TCPAddr)
 	if ok {
@@ -438,6 +499,8 @@ func getClientIP(conn net.Conn) string {
 }
 
 // isDNSError 判断错误是否为 DNS 解析失败
+// 参数 err: 需要判断的错误对象
+// 返回：true 表示是 DNS 错误，false 表示不是
 func isDNSError(err error) bool {
 	if err == nil {
 		return false
@@ -450,6 +513,8 @@ func isDNSError(err error) bool {
 }
 
 // isConnectionError 判断错误是否是连接目标服务器失败（非代理服务器问题）
+// 参数 err: 需要判断的错误对象
+// 返回：true 表示是连接错误，false 表示不是
 func isConnectionError(err error) bool {
 	if err == nil {
 		return false
@@ -462,6 +527,89 @@ func isConnectionError(err error) bool {
 }
 
 // copyWithBuffer 使用指定缓冲区复制数据，减少内存分配
+// 参数 dst: 目标写入器；src: 源读取器；buf: 缓冲区
+// 返回：复制的字节数和可能的错误
 func copyWithBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
 	return io.CopyBuffer(dst, src, buf)
+}
+
+// userDataPersister 定期持久化用户数据到数据库（防止重启丢失）
+func (s *Server) userDataPersister() {
+	ticker := time.NewTicker(10 * time.Second) // 每 10 秒保存一次
+	defer ticker.Stop()
+
+	for range ticker.C {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+			// 如果是 PasswordAuth，持久化所有用户数据
+			if auth, ok := s.config.Auth.(*PasswordAuth); ok {
+				s.persistUsers(auth)
+			}
+		}
+	}
+}
+
+// persistUsers 持久化用户数据到数据库
+func (s *Server) persistUsers(auth *PasswordAuth) {
+	// 先复制数据，避免持有锁期间进行数据库 IO 操作
+	auth.mu.RLock()
+	type userSnapshot struct {
+		username string
+		user     *User
+	}
+	snapshots := make([]userSnapshot, 0, len(auth.users))
+
+	for username, user := range auth.users {
+		// 读取原子值并创建副本
+		snapshot := &User{
+			Username:         user.Username,
+			Password:         user.Password,
+			ReadSpeedLimit:   user.ReadSpeedLimit,
+			WriteSpeedLimit:  user.WriteSpeedLimit,
+			MaxConnections:   user.MaxConnections,
+			MaxIPConnections: user.MaxIPConnections,
+			Enabled:          user.Enabled,
+			UploadTotal:      atomic.LoadInt64(&user.UploadTotal),
+			DownloadTotal:    atomic.LoadInt64(&user.DownloadTotal),
+			CreateTime:       user.CreateTime,
+			LastActivity:     atomic.LoadInt64(&user.LastActivity),
+			QuotaPeriod:      user.QuotaPeriod,
+			QuotaBytes:       user.QuotaBytes,
+			QuotaUsed:        atomic.LoadInt64(&user.QuotaUsed),
+			QuotaResetTime:   user.QuotaResetTime,
+			QuotaStartTime:   user.QuotaStartTime,
+			QuotaEndTime:     user.QuotaEndTime,
+		}
+		snapshots = append(snapshots, userSnapshot{username: username, user: snapshot})
+	}
+	auth.mu.RUnlock()
+
+	if dbManager == nil {
+		log.Printf("警告：数据库管理器未初始化，无法持久化用户数据")
+		return
+	}
+
+	savedCount := 0
+	failedCount := 0
+
+	// 释放锁后进行数据库写入
+	for _, snapshot := range snapshots {
+		username := snapshot.username
+		userCopy := snapshot.user
+
+		// 保存到数据库
+		if err := dbManager.SaveUser(userCopy); err != nil {
+			log.Printf("❌ 持久化用户 [%s] 失败：%v", username, err)
+			failedCount++
+		} else {
+			if userCopy.QuotaUsed > 0 {
+				log.Printf("✅ 持久化用户 [%s] 成功 (配额：%.2f MB / %.2f MB)",
+					username, float64(userCopy.QuotaUsed)/1024/1024, float64(userCopy.QuotaBytes)/1024/1024)
+			}
+			savedCount++
+		}
+	}
+
 }

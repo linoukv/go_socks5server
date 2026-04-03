@@ -1,183 +1,304 @@
+// =============================================================================
+// 文件名：main.go
+// 描述：SOCKS5 代理服务器 - 程序入口文件
+// 功能：程序启动、初始化、配置加载、优雅关闭
+// =============================================================================
+
 package main
 
 import (
-	"flag"      // 命令行参数解析
-	"fmt"       // 格式化输出
-	"log"       // 日志记录
-	"os"        // 操作系统功能
-	"os/signal" // 信号处理
-	"strings"   // 字符串处理
-	"syscall"   // 系统调用
-	"time"      // 时间处理
+	"log"       // 日志记录包
+	"os"        // 操作系统接口包
+	"os/signal" // 信号处理包
+	"runtime"   // Go 运行时信息包
+	"syscall"   // 系统调用包（用于接收系统信号）
+	"time"      // 时间处理包
 )
 
+// dbManager 全局数据库管理器指针
+// 用途：在服务器运行期间持久化用户数据和流量统计
+// 注意：这是一个全局变量，在 userDataPersister 和 persistUsers 函数中使用
+var dbManager *DatabaseManager
+
+// main 程序主入口函数
+// 执行流程：
+// 1. 设置 CPU 核心数优化（GOMAXPROCS）
+// 2. 初始化 SQLite 数据库
+// 3. 从数据库加载服务器配置
+// 4. 创建 SOCKS5 服务器实例
+// 5. 配置认证方式（无认证/密码认证）
+// 6. 启动 Web 管理界面
+// 7. 启动 SOCKS5 服务器
+// 8. 等待系统信号（SIGINT/SIGTERM）实现优雅关闭
 func main() {
-	// 定义命令行参数
-	var (
-		listenAddr         = flag.String("l", "0.0.0.0:1080", "监听地址")         // 服务器监听地址，默认所有网卡 1080 端口
-		username           = flag.String("u", "", "用户名（为空则不启用认证）")            // 认证用户名，空表示无认证
-		password           = flag.String("p", "", "密码")                       // 认证密码
-		workers            = flag.Int("w", 10000, "最大并发工作数")                  // 最大并发处理的 goroutine 数量
-		maxConnIP          = flag.Int("c", 0, "每个 IP 最大连接数")                  // 限制单个 IP 的最大连接数，防止滥用
-		udpTimeout         = flag.Int("t", 300, "UDP 关联超时（秒）")                // UDP 代理连接的超时时间
-		readLimit          = flag.Int64("rl", 0, "读取速度限制（字节/秒），0 为不限速")       // 上传限速
-		writeLimit         = flag.Int64("wl", 0, "写入速度限制（字节/秒），0 为不限速")       // 下载限速
-		enableUserMgmt     = flag.Bool("user-mgmt", false, "启用多用户管理")         // 是否启用多用户管理
-		userMaxConnections = flag.Int("umc", 0, "单用户最大连接数，0 为不限")             // 每个用户的最大连接数
-		webAddr            = flag.String("web", ":8080", "Web 管理界面监听地址")      // Web 管理界面地址
-		dbPath             = flag.String("db", "socks5.db", "SQLite 数据库文件路径") // 数据库路径
-	)
-	flag.Parse() // 解析命令行参数
+	// =========================================================================
+	// 步骤 1: CPU 性能优化 - 设置 GOMAXPROCS 为物理 CPU 核心数
+	// 目的：最大化利用多核 CPU，提升并发处理能力
+	// 说明：Go 默认会根据系统情况设置，但显式设置可以确保最优性能
+	// =========================================================================
+	numCPU := runtime.NumCPU() // 获取逻辑 CPU 核心数
+	runtime.GOMAXPROCS(numCPU) // 设置最大并行工作线程数
+	log.Printf("万兆性能优化版 - GOMAXPROCS=%d (CPU 核心数)", numCPU)
+	// =========================================================================
+	// 步骤 2: 获取数据库路径（支持环境变量配置）
+	// 优先级：SOCKS5_DB_PATH 环境变量 > 默认值 "socks5.db"
+	// =========================================================================
+	dbPath := getEnvOrDefault("SOCKS5_DB_PATH", "socks5.db")
 
-	// 创建服务器配置对象
-	config := &Config{
-		ListenAddr:           *listenAddr,                              // 监听地址
-		MaxWorkers:           *workers,                                 // 最大工作协程数
-		MaxConnPerIP:         *maxConnIP,                               // 单 IP 最大连接数
-		HandshakeTimeout:     10 * time.Second,                         // 握手超时时间 10 秒
-		IdleTimeout:          300 * time.Second,                        // 空闲超时时间 300 秒
-		UDPTimeout:           time.Duration(*udpTimeout) * time.Second, // UDP 超时时间
-		ReadSpeedLimit:       *readLimit,                               // 上传限速
-		WriteSpeedLimit:      *writeLimit,                              // 下载限速
-		EnableUserManagement: *enableUserMgmt,                          // 是否启用多用户管理
-	}
-
-	// 配置认证方式：如果提供了用户名和密码则启用密码认证，否则使用无认证模式
-	var auth *PasswordAuth
-	if *username != "" && *password != "" {
-		auth = NewPasswordAuth()           // 创建密码认证器
-		auth.AddUser(*username, *password) // 添加用户
-
-		// 如果启用了多用户管理，设置用户的连接数限制
-		if *enableUserMgmt && *userMaxConnections > 0 {
-			auth.SetUserMaxConnections(*username, *userMaxConnections)
-			log.Printf("启用多用户管理，用户：%s，最大连接数：%d", *username, *userMaxConnections)
-		}
-
-		config.Auth = auth // 设置认证配置
-		log.Printf("启用用户名/密码认证，用户名：%s", *username)
-	} else {
-		config.Auth = &NoAuth{} // 使用无认证
-		log.Println("启用无认证模式（警告：不安全，仅用于测试）")
-	}
-
-	// 创建 SOCKS5 服务器实例
-	server := NewServer(config)
-
-	// 初始化数据库（如果指定了数据库路径）
+	// =========================================================================
+	// 步骤 3: 初始化 SQLite 数据库管理器
+	// 如果数据库初始化失败，服务器仍可使用（但不支持持久化）
+	// =========================================================================
 	var db *DatabaseManager
-	if *dbPath != "" {
-		var err error
-		db, err = NewDatabaseManager(*dbPath)
+	var err error
+
+	if dbPath != "" {
+		// 创建新的数据库管理器（会自动创建表结构）
+		db, err = NewDatabaseManager(dbPath)
 		if err != nil {
-			log.Printf("数据库初始化失败：%v", err)
+			// 数据库初始化失败时记录错误，但继续启动服务器
+			log.Printf("数据库初始化失败：%v，使用默认配置启动", err)
 		} else {
 			defer db.Close() // 确保程序退出时关闭数据库连接
 			log.Println("SQLite 数据库已连接")
+			// 保存到全局变量，供后续持久化使用
+			dbManager = db
 		}
 	}
 
-	// 启动 Web 管理界面
-	var webServer *WebServer
-	if *webAddr != "" {
-		webServer = NewWebServer(auth, db, *webAddr)
-		go func() {
-			if err := webServer.Start(); err != nil {
-				log.Printf("Web 服务错误：%v", err)
+	// =========================================================================
+	// 步骤 4: 从数据库加载服务器配置
+	// 如果数据库不存在或无配置记录，使用默认配置
+	// =========================================================================
+	config := loadServerConfig(db)
+
+	// =========================================================================
+	// 步骤 5: 创建 SOCKS5 服务器实例
+	// 使用加载的配置初始化服务器对象
+	// =========================================================================
+	server := NewServer(config)
+
+	// =========================================================================
+	// 步骤 6: 配置认证方式
+	// 根据配置启用用户管理（密码认证）或无认证模式
+	// =========================================================================
+	var auth *PasswordAuth
+	if config.EnableUserManagement {
+		// 启用密码认证模式
+		auth = NewPasswordAuth() // 创建密码认证器
+		config.Auth = auth       // 设置到服务器配置
+
+		// 从数据库加载所有用户到内存中的认证器
+		if db != nil {
+			if err := db.LoadAllUsersToAuth(auth); err != nil {
+				log.Printf("加载用户数据失败：%v", err)
+			} else {
+				log.Printf("已从数据库加载 %d 个用户到内存", len(auth.users))
 			}
-		}()
-		log.Printf("Web 管理界面已启动在 http://%s", *webAddr)
+		}
+	} else {
+		// 无认证模式（警告：不安全，仅用于测试环境）
+		config.Auth = &NoAuth{}
+		log.Println("无认证模式（警告：不安全，仅用于测试）")
 	}
 
-	// 创建信号通道，用于接收系统信号（如 Ctrl+C）
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM) // 监听中断和终止信号
+	// =========================================================================
+	// 步骤 7: 启动 Web 管理界面
+	// Web 服务在独立 goroutine 中运行，不阻塞主程序
+	// 必须启动，用于后续配置服务器和管理用户
+	// =========================================================================
+	webAddr := getEnvOrDefault("SOCKS5_WEB_ADDR", ":8080") // Web 监听地址
+	webServer := NewWebServer(auth, db, server, webAddr)   // 创建 Web 服务器
+	go func() {
+		if err := webServer.Start(); err != nil {
+			log.Printf("Web 服务错误：%v", err)
+		}
+	}()
+	log.Printf("Web 管理界面已启动在 http://%s", webAddr)
+	log.Printf("服务器配置：%+v", summarizeConfig(config)) // 打印配置摘要
 
-	// 在后台 goroutine 中启动服务器
+	// =========================================================================
+	// 步骤 7.1: 启动流量日志定时清理任务
+	// 每天凌晨 2 点自动清理 1 天前的流量日志，避免数据库无限膨胀
+	// =========================================================================
+	go func() {
+		// 等待系统启动完成
+		time.Sleep(10 * time.Second)
+
+		// 检查数据库是否初始化
+		if db == nil {
+			log.Println("数据库未初始化，跳过流量日志清理任务")
+			return
+		}
+
+		// 首次启动时执行一次清理
+		log.Println("启动流量日志清理...")
+		if err := db.CleanOldTrafficLogs(1); err != nil {
+			log.Printf("流量日志清理失败：%v", err)
+		} else {
+			// 显示当前日志数量
+			if count, err := db.GetTrafficLogsCount(); err == nil {
+				log.Printf("当前流量日志总数：%d 条", count)
+			}
+		}
+
+		// 创建定时器：每天凌晨 2 点执行
+		for {
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 2, 0, 0, 0, now.Location())
+
+			// 如果今天的 2 点已过，设置为明天 2 点
+			if now.After(next) {
+				next = next.Add(24 * time.Hour)
+			}
+
+			duration := next.Sub(now)
+			log.Printf("下次流量日志清理时间：%s (等待 %v)", next.Format("2006-01-02 15:04:05"), duration.Round(time.Second))
+
+			time.Sleep(duration)
+
+			// 执行清理
+			log.Println("执行定时流量日志清理...")
+			if err := db.CleanOldTrafficLogs(30); err != nil {
+				log.Printf("流量日志清理失败：%v", err)
+			} else {
+				// 显示当前日志数量
+				if count, err := db.GetTrafficLogsCount(); err == nil {
+					log.Printf("当前流量日志总数：%d 条", count)
+				}
+			}
+		}
+	}()
+	log.Println("流量日志定时清理任务已启动（每天凌晨 2 点清理 30 天前的数据）")
+
+	// =========================================================================
+	// 步骤 8: 创建系统信号通道
+	// 监听 SIGINT (Ctrl+C) 和 SIGTERM (终止信号)
+	// =========================================================================
+	sigCh := make(chan os.Signal, 1) // 带缓冲的信号通道
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// =========================================================================
+	// 步骤 9: 在独立 goroutine 中启动 SOCKS5 服务器
+	// 非阻塞启动，允许后续代码继续执行
+	// =========================================================================
 	go func() {
 		if err := server.Start(); err != nil {
-			log.Fatalf("服务器错误：%v", err)
+			log.Fatalf("服务器错误：%v", err) // 启动失败则直接退出
 		}
 	}()
 
-	// 阻塞等待信号
+	// =========================================================================
+	// 步骤 10: 阻塞等待系统信号
+	// 程序会在这里暂停，直到收到 SIGINT 或 SIGTERM 信号
+	// =========================================================================
 	sig := <-sigCh
 	log.Printf("收到信号：%v，正在关闭服务器...", sig)
 
-	// 优雅关闭服务器
+	// =========================================================================
+	// 步骤 11: 优雅关闭服务器
+	// 按顺序关闭 SOCKS5 服务器和 Web 服务器，确保资源正确释放
+	// =========================================================================
 	if err := server.Stop(); err != nil {
 		log.Printf("停止服务器出错：%v", err)
 	}
 
-	// 关闭 Web 服务器
 	if webServer != nil {
 		if err := webServer.Stop(); err != nil {
 			log.Printf("停止 Web 服务器出错：%v", err)
 		}
 	}
-
-	// 数据库连接已通过 defer 关闭
 }
 
-// parseUsers 解析用户列表字符串，格式：user1:pass1,user2:pass2
-// 将多个用户信息解析为 map[用户名]密码 的形式
-func parseUsers(usersStr string) map[string]string {
-	users := make(map[string]string) // 创建用户映射表
-	if usersStr == "" {
-		return users // 空字符串返回空 map
+// loadServerConfig 从数据库加载服务器配置
+func loadServerConfig(db *DatabaseManager) *Config {
+	// 默认配置
+	config := DefaultConfig()
+
+	// 如果数据库不存在，返回默认配置
+	if db == nil {
+		log.Println("数据库不存在，使用默认配置启动")
+		return config
 	}
 
-	// 按逗号分割多个用户
-	pairs := strings.Split(usersStr, ",")
-	for _, pair := range pairs {
-		// 按冒号分割用户名和密码，SplitN 限制最多分割 2 部分
-		parts := strings.SplitN(pair, ":", 2)
-		if len(parts) == 2 {
-			// 去除前后空格后存入 map
-			users[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
+	// 尝试从数据库加载配置
+	loaded := false
+
+	// 加载监听地址
+	if addr, err := db.GetConfig("listen_addr"); err == nil && addr != "" {
+		config.ListenAddr = addr
+		loaded = true
 	}
-	return users
+
+	// 加载工作协程数
+	if workers, err := db.GetIntConfig("max_workers"); err == nil && workers > 0 {
+		config.MaxWorkers = int(workers)
+		loaded = true
+	}
+
+	// 加载单 IP 最大连接数
+	if maxConn, err := db.GetIntConfig("max_conn_per_ip"); err == nil && maxConn > 0 {
+		config.MaxConnPerIP = int(maxConn)
+		loaded = true
+	}
+
+	// 加载上传限速
+	if readLimit, err := db.GetInt64Config("read_speed_limit"); err == nil && readLimit > 0 {
+		config.ReadSpeedLimit = readLimit
+		loaded = true
+	}
+
+	// 加载下载限速
+	if writeLimit, err := db.GetInt64Config("write_speed_limit"); err == nil && writeLimit > 0 {
+		config.WriteSpeedLimit = writeLimit
+		loaded = true
+	}
+
+	// 加载 TCP Keepalive 周期
+	if keepalive, err := db.GetIntConfig("tcp_keepalive_period"); err == nil && keepalive > 0 {
+		config.TCPKeepAlivePeriod = time.Duration(keepalive) * time.Second
+		loaded = true
+	}
+
+	// 加载缓冲池大小
+	if bufferPool, err := db.GetIntConfig("buffer_pool_size"); err == nil && bufferPool > 0 {
+		config.RecvBufferPool = NewBufferPool(int(bufferPool) * 1024)
+		config.SendBufferPool = NewBufferPool(int(bufferPool) * 1024)
+		loaded = true
+	}
+
+	// 加载是否启用多用户管理
+	if enableMgmt, err := db.GetConfig("enable_user_management"); err == nil && enableMgmt != "" {
+		config.EnableUserManagement = (enableMgmt == "true" || enableMgmt == "1")
+		loaded = true
+	}
+
+	if loaded {
+		log.Println("已从数据库加载服务器配置")
+	} else {
+		log.Println("数据库无配置记录，使用默认配置")
+	}
+
+	return config
 }
 
-// printUsage 打印程序使用说明和示例
-func printUsage() {
-	fmt.Println(`SOCKS5 Server - 高性能 SOCKS5 代理服务器
+// getEnvOrDefault 获取环境变量或返回默认值
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
 
-用法:
-  socks5-server [选项]
-
-选项:
-  -l string
-        监听地址 (默认 "0.0.0.0:1080")
-  -u string
-        用户名（为空则不启用认证）
-  -p string
-        密码
-  -w int
-        最大并发工作数 (默认 10000)
-  -c int
-        每个 IP 最大连接数 (默认 100)
-  -t int
-        UDP 关联超时（秒）(默认 300)
-  -rl int
-        读取速度限制（字节/秒），0 为不限速 (默认 0)
-  -wl int
-        写入速度限制（字节/秒），0 为不限速 (默认 0)
-
-示例:
-  # 无认证模式（仅测试使用）
-  socks5-server
-
-  # 带认证模式
-  socks5-server -u admin -p password
-
-  # 自定义监听地址
-  socks5-server -l 127.0.0.1:1080 -u admin -p password
-
-  # 限制上传速度为 1MB/s，下载速度为 2MB/s
-  socks5-server -rl 1048576 -wl 2097152
-
-  # 组合使用：认证 + 限速
-  socks5-server -u admin -p password -rl 524288 -wl 1048576`)
+// summarizeConfig 返回配置摘要（用于日志）
+func summarizeConfig(config *Config) map[string]interface{} {
+	return map[string]interface{}{
+		"listen_addr":       config.ListenAddr,
+		"max_workers":       config.MaxWorkers,
+		"max_conn_per_ip":   config.MaxConnPerIP,
+		"read_speed_limit":  config.ReadSpeedLimit,
+		"write_speed_limit": config.WriteSpeedLimit,
+		"tcp_keepalive":     config.TCPKeepAlivePeriod.Seconds(),
+		"user_management":   config.EnableUserManagement,
+	}
 }

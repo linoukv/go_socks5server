@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>管理员登录 - SOCKS5 代理</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: Arial, sans-serif; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            min-height: 100vh; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .login-container { 
+            background: white; 
+            padding: 40px; 
+            border-radius: 10px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
+            width: 100%; 
+            max-width: 400px; 
+        }
+        .login-container h1 { 
+            text-align: center; 
+            color: #333; 
+            margin-bottom: 10px; 
+            font-size: 24px;
+        }
+        .login-container .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .error { 
+            background: #fee; 
+            color: #c33; 
+            padding: 10px; 
+            border-radius: 4px; 
+            margin-bottom: 15px; 
+            display: none; 
+            font-size: 14px;
+        }
+        .form-group { 
+            margin-bottom: 20px; 
+        }
+        .form-group label { 
+            display: block; 
+            margin-bottom: 8px; 
+            font-weight: bold;
+            color: #333;
+            font-size: 14px;
+        }
+        .form-group input { 
+            width: 100%; 
+            padding: 12px; 
+            border: 1px solid #ddd; 
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .form-group input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.1);
+        }
+        .captcha-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .captcha-group input {
+            flex: 1;
+        }
+        #captchaImage {
+            height: 45px;
+            cursor: pointer;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+        #captchaImage:hover {
+            opacity: 0.9;
+        }
+        .btn { 
+            width: 100%;
+            background: #27ae60; 
+            color: white; 
+            border: none; 
+            padding: 12px; 
+            border-radius: 4px; 
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            transition: background 0.3s;
+        }
+        .btn:hover { 
+            background: #229954; 
+        }
+        .btn:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
+        .back-link {
+            text-align: center;
+            margin-top: 20px;
+        }
+        .back-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 14px;
+        }
+        .back-link a:hover {
+            text-decoration: underline;
+        }
+        .loading {
+            text-align: center;
+            color: #666;
+            margin-top: 10px;
+            font-size: 14px;
+            display: none;
+        }
+        @media (max-width: 480px) {
+            .login-container {
+                padding: 30px 20px;
+                max-width: 95%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h1>🔐 SOCKS5 管理后台</h1>
+        <p class="subtitle">管理员身份验证</p>
+        
+        <div id="loginError" class="error"></div>
+        
+        <form id="loginForm">
+            <div class="form-group">
+                <label for="loginUsername">用户名</label>
+                <input type="text" id="loginUsername" required placeholder="请输入管理员用户名" autocomplete="username">
+            </div>
+            
+            <div class="form-group">
+                <label for="loginPassword">密码</label>
+                <input type="password" id="loginPassword" required placeholder="请输入管理员密码" autocomplete="current-password">
+            </div>
+            
+            <div class="form-group">
+                <label for="loginCaptcha">验证码</label>
+                <div class="captcha-group">
+                    <input type="text" id="loginCaptcha" required placeholder="输入验证码" autocomplete="off">
+                    <img id="captchaImage" src="" alt="验证码" onclick="refreshCaptcha()" title="点击刷新验证码">
+                </div>
+                <input type="hidden" id="captchaID">
+            </div>
+            
+            <button type="submit" class="btn" id="loginBtn">登录</button>
+            <div class="loading" id="loadingTip">登录中...</div>
+        </form>
+        
+        <div class="back-link">
+            <a href="/index.html">→ 返回管理面板</a>
+        </div>
+    </div>
+
+    <script>
+        // 检查是否已登录
+        window.onload = async function() {
+            const token = localStorage.getItem('adminToken');
+            if (token) {
+                try {
+                    const response = await fetch('/api/admin/check', {
+                        headers: {
+                            'X-Auth-Token': token
+                        }
+                    });
+                    if (response.ok) {
+                        // 已登录，跳转到主页
+                        window.location.href = '/index.html';
+                        return;
+                    }
+                } catch (error) {
+                    console.error('检查登录状态失败:', error);
+                }
+            }
+            
+            // 加载验证码
+            refreshCaptcha();
+        };
+
+        // 刷新验证码
+        async function refreshCaptcha() {
+            try {
+                // 添加时间戳防止缓存
+                const timestamp = Date.now();
+                const response = await fetch(`/api/admin/captcha?action=get&_t=${timestamp}`);
+                
+                if (!response.ok) {
+                    throw new Error('获取验证码失败：' + response.status);
+                }
+                
+                // 从响应头获取验证码 ID
+                const captchaID = response.headers.get('X-Captcha-ID');
+                if (!captchaID) {
+                    throw new Error('未获取到验证码 ID');
+                }
+                
+                // 更新验证码图片和 ID
+                const imgBlob = await response.blob();
+                const imgUrl = URL.createObjectURL(imgBlob);
+                document.getElementById('captchaImage').src = imgUrl;
+                document.getElementById('captchaID').value = captchaID;
+            } catch (error) {
+                console.error('刷新验证码失败:', error);
+                // 如果失败，直接使用 URL（浏览器会处理）
+                const timestamp = Date.now();
+                document.getElementById('captchaImage').src = `/api/admin/captcha?action=get&_t=${timestamp}`;
+            }
+        }
+
+        // 处理登录表单提交
+        document.getElementById('loginForm').onsubmit = async function(e) {
+            e.preventDefault();
+            
+            const username = document.getElementById('loginUsername').value.trim();
+            const password = document.getElementById('loginPassword').value;
+            const captcha = document.getElementById('loginCaptcha').value.trim();
+            const captchaID = document.getElementById('captchaID').value;
+            
+            const loginBtn = document.getElementById('loginBtn');
+            const loadingTip = document.getElementById('loadingTip');
+            const errorDiv = document.getElementById('loginError');
+            
+            // 清空错误信息
+            errorDiv.style.display = 'none';
+            errorDiv.textContent = '';
+            
+            // 禁用按钮，显示加载中
+            loginBtn.disabled = true;
+            loadingTip.style.display = 'block';
+            
+            try {
+                const response = await fetch('/api/admin/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        username: username,
+                        password: password,
+                        captcha: captcha,
+                        captcha_id: captchaID
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok && result.status === 'success') {
+                    // 登录成功，保存 Token
+                    localStorage.setItem('adminToken', result.token);
+                    localStorage.setItem('adminUsername', result.username);
+                    
+                    // 延迟一下跳转，让用户看到成功状态
+                    setTimeout(() => {
+                        window.location.href = '/index.html';
+                    }, 500);
+                } else {
+                    // 登录失败
+                    errorDiv.textContent = result.error || '登录失败，请检查用户名和密码';
+                    errorDiv.style.display = 'block';
+                    
+                    // 刷新验证码
+                    refreshCaptcha();
+                    document.getElementById('loginCaptcha').value = '';
+                    
+                    // 重新启用按钮
+                    loginBtn.disabled = false;
+                    loadingTip.style.display = 'none';
+                }
+            } catch (error) {
+                console.error('登录请求失败:', error);
+                errorDiv.textContent = '网络错误，请稍后重试';
+                errorDiv.style.display = 'block';
+                
+                // 刷新验证码
+                refreshCaptcha();
+                document.getElementById('loginCaptcha').value = '';
+                
+                // 重新启用按钮
+                loginBtn.disabled = false;
+                loadingTip.style.display = 'none';
+            }
+        };
+
+        // 回车键提交表单
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                const activeElement = document.activeElement;
+                if (activeElement.tagName === 'INPUT' && activeElement.type !== 'submit') {
+                    e.preventDefault();
+                    document.getElementById('loginForm').requestSubmit();
+                }
+            }
+        });
+    </script>
+</body>
+</html>

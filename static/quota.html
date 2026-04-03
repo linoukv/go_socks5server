@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>流量配额管理 - SOCKS5 代理</title>
+    <!-- Flatpickr 时间选择器 CSS -->
+    <link rel="stylesheet" href="/static/lib/flatpickr.min.css">
+    <link rel="stylesheet" href="/static/lib/light.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #f5f5f5; }
+        .header { background: #2c3e50; color: white; padding: 20px; text-align: center; }
+        .container { max-width: 1400px; margin: 20px auto; padding: 20px; }
+        .nav-bar { background: white; padding: 15px 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .nav-bar a { color: #2c3e50; text-decoration: none; margin-right: 20px; padding: 8px 15px; border-radius: 4px; }
+        .nav-bar a:hover { background: #3498db; color: white; }
+        .nav-bar a.active { background: #3498db; color: white; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .card h2 { color: #2c3e50; margin-bottom: 15px; }
+        .btn { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin: 5px; }
+        .btn:hover { background: #2980b9; }
+        .btn-success { background: #27ae60; }
+        .btn-danger { background: #e74c3c; }
+        .btn-warning { background: #f39c12; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; font-weight: bold; }
+        tr:hover { background: #f8f9fa; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; }
+        .form-group input, .form-group select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; overflow-y: auto; }
+        .modal-content { background: white; margin: 5% auto; padding: 30px; border-radius: 8px; max-width: 600px; max-height: 90vh; overflow-y: auto; }
+        .close { float: right; font-size: 28px; cursor: pointer; }
+        .progress-bar { background: #ecf0f1; border-radius: 4px; overflow: hidden; margin: 10px 0; }
+        .progress-fill { height: 20px; background: linear-gradient(90deg, #27ae60, #f39c12, #e74c3c); transition: width 0.3s; }
+        .badge { padding: 3px 8px; border-radius: 4px; font-size: 12px; }
+        .badge-success { background: #27ae60; color: white; }
+        .badge-warning { background: #f39c12; color: white; }
+        .badge-danger { background: #e74c3c; color: white; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 8px; }
+        .stat-card h3 { font-size: 2em; margin: 10px 0; }
+        .filter-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+        .filter-bar input, .filter-bar select { padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+        @media (max-width: 768px) {
+            .modal-content { margin: 10% auto; padding: 20px; max-width: 95%; }
+            .header h1 { font-size: 1.5em; }
+            .stats-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📊 流量配额管理中心</h1>
+    </div>
+    
+    <div class="container">
+        <!-- 导航栏 -->
+        <div class="nav-bar">
+            <a href="/index.html">🏠 主页</a>
+            <a href="/quota.html" class="active">📊 流量配额</a>
+        </div>
+
+        <!-- 统计卡片 -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3 id="totalUsers">-</h3>
+                <p>总用户数</p>
+            </div>
+            <div class="stat-card">
+                <h3 id="usersWithQuota">-</h3>
+                <p>已设置配额用户</p>
+            </div>
+            <div class="stat-card">
+                <h3 id="overLimitUsers">-</h3>
+                <p>超额用户</p>
+            </div>
+            <div class="stat-card">
+                <h3 id="expiringSoon">-</h3>
+                <p>即将到期配额</p>
+            </div>
+        </div>
+
+        <!-- 筛选工具栏 -->
+        <div class="card">
+            <div class="filter-bar">
+                <input type="text" id="searchUsername" placeholder="搜索用户名..." style="flex: 1;">
+                <select id="filterQuotaType">
+                    <option value="">所有配额类型</option>
+                    <option value="custom">自定义时间段</option>
+                    <option value="unlimited">无限制</option>
+                </select>
+                <select id="filterStatus">
+                    <option value="">所有状态</option>
+                    <option value="normal">正常</option>
+                    <option value="warning">即将超额</option>
+                    <option value="exceeded">已超额</option>
+                    <option value="expired">已到期</option>
+                </select>
+                <button class="btn" onclick="applyFilters()">🔍 筛选</button>
+                <button class="btn btn-warning" onclick="resetFilters()">🔄 重置</button>
+                <button class="btn btn-success" onclick="showBatchSetModal()">⚙️ 批量设置</button>
+            </div>
+        </div>
+
+        <!-- 配额列表 -->
+        <div class="card">
+            <h2>流量配额配置</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th><input type="checkbox" id="selectAll" onchange="toggleSelectAll()"></th>
+                        <th>用户名</th>
+                        <th>所属分组</th>
+                        <th>配额类型</th>
+                        <th>配额值 (MB)</th>
+                        <th>历史总流量 (MB)</th>
+                        <th>周期内已用 (MB)</th>
+                        <th>使用率</th>
+                        <th>状态</th>
+                        <th>生效时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="quotaTableBody">
+                    <tr><td colspan="11" style="text-align: center;">加载中...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 编辑配额模态框 -->
+    <div id="editQuotaModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('editQuotaModal')">&times;</span>
+            <h2>✏️ 设置流量配额</h2>
+            <form id="editQuotaForm">
+                <input type="hidden" id="editUsername">
+                
+                <div class="form-group">
+                    <label>用户名</label>
+                    <input type="text" id="editUsernameDisplay" disabled>
+                </div>
+
+                <div class="form-group">
+                    <label>配额类型</label>
+                    <select id="editQuotaPeriod" onchange="toggleEditTimeFields()">
+                        <option value="custom">自定义时间段</option>
+                        <option value="unlimited">无限制</option>
+                    </select>
+                </div>
+
+                <div id="customTimeFields" style="display: none;">
+                    <div class="form-group">
+                        <label>生效开始时间</label>
+                        <input type="text" id="editStartTime" placeholder="点击选择日期和时间" readonly style="cursor: pointer;">
+                        <small style="color: #666;">📅 点击输入框选择日期和时间</small>
+                    </div>
+                    <div class="form-group">
+                        <label>生效结束时间</label>
+                        <input type="text" id="editEndTime" placeholder="点击选择日期和时间" readonly style="cursor: pointer;">
+                        <small style="color: #666;">📅 点击输入框选择日期和时间</small>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>流量配额 (MB，0 表示不限制)</label>
+                    <input type="number" id="editQuotaBytes" min="0" value="0">
+                    <small style="color: #666;">设置为 0 表示不限制流量</small>
+                </div>
+
+                <div class="form-group">
+                    <label>当前已使用</label>
+                    <div id="editUsedDisplay" style="padding: 10px; background: #f5f5f5; border-radius: 4px;">-</div>
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn" onclick="closeModal('editQuotaModal')">取消</button>
+                    <button type="submit" class="btn btn-success">保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- 批量设置模态框 -->
+    <div id="batchSetModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('batchSetModal')">&times;</span>
+            <h2>⚙️ 批量设置流量配额</h2>
+            <form id="batchSetForm">
+                <div class="form-group">
+                    <label>选择用户（已选 <span id="selectedCount">0</span> 个）</label>
+                    <div style="max-height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; border-radius: 4px;">
+                        <div id="selectedUsersList">请先在列表中勾选用户</div>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>配额类型</label>
+                    <select id="batchQuotaPeriod" onchange="toggleBatchTimeFields()">
+                        <option value="custom">自定义时间段</option>
+                        <option value="unlimited">无限制</option>
+                    </select>
+                </div>
+
+                <div id="batchTimeFields" style="display: none;">
+                    <div class="form-group">
+                        <label>生效开始时间</label>
+                        <input type="text" id="batchStartTime" placeholder="点击选择日期和时间" readonly style="cursor: pointer;">
+                        <small style="color: #666;">📅 点击输入框选择日期和时间</small>
+                    </div>
+                    <div class="form-group">
+                        <label>生效结束时间</label>
+                        <input type="text" id="batchEndTime" placeholder="点击选择日期和时间" readonly style="cursor: pointer;">
+                        <small style="color: #666;">📅 点击输入框选择日期和时间</small>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>流量配额 (MB，0 表示不限制)</label>
+                    <input type="number" id="batchQuotaBytes" min="0" value="0">
+                </div>
+
+                <div class="modal-footer">
+                    <button type="button" class="btn" onclick="closeModal('batchSetModal')">取消</button>
+                    <button type="submit" class="btn btn-success">批量应用</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- 引入公共脚本 -->
+    <script src="/app.js"></script>
+    <script>
+        let allUsers = [];
+        let selectedUsers = new Set();
+
+        // 获取认证头
+        function getAuthHeaders() {
+            const token = localStorage.getItem('authToken') || localStorage.getItem('adminToken');
+            if (!token) {
+                console.error('[Token 检查] 未找到 token，跳转到登录页');
+                window.location.href = '/login.html';
+                return {};
+            }
+            return {
+                'Content-Type': 'application/json',
+                'X-Auth-Token': token
+            };
+        }
+
+        // 页面加载时检查登录状态
+        window.onload = async function() {
+            console.log('=== quota.html 开始加载 ===');
+            
+            // 首先检查 token 是否存在
+            const token = localStorage.getItem('authToken') || localStorage.getItem('adminToken');
+            if (!token) {
+                console.error('[Token 检查] 未找到 token，跳转到登录页');
+                window.location.href = '/login.html';
+                return;
+            }
+            
+            // 主动验证 token 有效性
+            try {
+                console.log('[Token 验证] 发送验证请求...');
+                const verifyResponse = await fetch('/api/admin/check', {
+                    method: 'GET',
+                    headers: {
+                        'X-Auth-Token': token
+                    }
+                });
+                
+                console.log('[Token 验证] 响应状态:', verifyResponse.status);
+                
+                if (verifyResponse.status === 401) {
+                    console.error('[Token 验证] Token 已过期，清除所有 token 并跳转');
+                    localStorage.removeItem('authToken');
+                    localStorage.removeItem('adminToken');
+                    localStorage.removeItem('currentUsername');
+                    window.location.href = '/login.html';
+                    return;
+                }
+                
+                const verifyData = await verifyResponse.json();
+                console.log('[Token 验证] 验证结果:', verifyData);
+                
+                if (!verifyData.logged_in) {
+                    console.error('[Token 验证] Token 无效，清除并跳转');
+                    localStorage.removeItem('authToken');
+                    localStorage.removeItem('adminToken');
+                    localStorage.removeItem('currentUsername');
+                    window.location.href = '/login.html';
+                    return;
+                }
+                
+                console.log('[Token 验证] ✅ Token 有效，继续加载页面');
+            } catch (error) {
+                console.error('[Token 验证] 验证失败:', error);
+                // 网络错误或其他异常，也清除 token 并跳转
+                localStorage.removeItem('authToken');
+                localStorage.removeItem('adminToken');
+                localStorage.removeItem('currentUsername');
+                window.location.href = '/login.html';
+                return;
+            }
+            
+            // Token 验证通过，加载配额页面
+            if (typeof checkLoginStatus === 'function') {
+                await checkLoginStatus();
+            } else {
+                console.error('checkLoginStatus 未定义，直接加载配额页面');
+            }
+            loadQuotaStats();
+            loadQuotaTable();
+        };
+
+        // 加载统计信息
+        async function loadQuotaStats() {
+            try {
+                const response = await fetch('/api/quota/stats', {
+                    headers: getAuthHeaders()
+                });
+                
+                // 检查是否是 401 未授权
+                if (response.status === 401) {
+                    console.error('[配额统计] 会话已过期，跳转到登录页');
+                    localStorage.removeItem('authToken');
+                    localStorage.removeItem('adminToken');
+                    localStorage.removeItem('currentUsername');
+                    window.location.href = '/login.html';
+                    return;
+                }
+                
+                if (!response.ok) throw new Error('加载失败');
+                const stats = await response.json();
+                
+                document.getElementById('totalUsers').textContent = stats.totalUsers || 0;
+                document.getElementById('usersWithQuota').textContent = stats.usersWithQuota || 0;
+                document.getElementById('overLimitUsers').textContent = stats.overLimitUsers || 0;
+                document.getElementById('expiringSoon').textContent = stats.expiringSoon || 0;
+            } catch (error) {
+                console.error('加载统计信息失败:', error);
+            }
+        }
+
+        // 加载配额表格
+        async function loadQuotaTable() {
+            try {
+                const response = await fetch('/api/users?includeTraffic=true', {
+                    headers: getAuthHeaders()
+                });
+                
+                // 检查是否是 401 未授权
+                if (response.status === 401) {
+                    console.error('[用户列表] 会话已过期，跳转到登录页');
+                    localStorage.removeItem('authToken');
+                    localStorage.removeItem('adminToken');
+                    localStorage.removeItem('currentUsername');
+                    window.location.href = '/login.html';
+                    return;
+                }
+                
+                if (!response.ok) throw new Error('加载失败');
+                const users = await response.json();
+                allUsers = users;
+                
+                renderQuotaTable(users);
+            } catch (error) {
+                console.error('加载用户列表失败:', error);
+                document.getElementById('quotaTableBody').innerHTML = 
+                    '<tr><td colspan="11" style="text-align: center; color: red;">加载失败</td></tr>';
+            }
+        }
+
+        // 渲染表格
+        function renderQuotaTable(users) {
+            const tbody = document.getElementById('quotaTableBody');
+            if (users.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="11" style="text-align: center;">暂无数据</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = users.map(user => {
+                // ✅ 修复：直接使用 user 对象，不要根据 quota_bytes 判断
+                // 因为 quota_bytes 可能为 0（不限制流量），但 quota_period 可能是 'custom'
+                const quotaInfo = user;
+                const totalUsed = ((user.upload_total || 0) + (user.download_total || 0)) / 1024 / 1024;
+                const quotaUsed = (quotaInfo.quota_used || 0) / 1024 / 1024;
+                const quotaMB = quotaInfo.quota_bytes ? (quotaInfo.quota_bytes / 1024 / 1024) : 0;
+                const usagePercent = quotaMB > 0 ? Math.min(100, (quotaUsed / quotaMB * 100)).toFixed(1) : 0;
+                
+                let statusBadge = '';
+                if (quotaMB === 0) {
+                    statusBadge = '<span class="badge badge-success">无限制</span>';
+                } else if (quotaUsed >= quotaMB) {
+                    statusBadge = '<span class="badge badge-danger">已超额</span>';
+                } else if (usagePercent > 80) {
+                    statusBadge = '<span class="badge badge-warning">即将超额</span>';
+                } else {
+                    statusBadge = '<span class="badge badge-success">正常</span>';
+                }
+
+                let periodText = '';
+                switch(quotaInfo.quota_period) {
+                    case 'custom': periodText = '自定义'; break;
+                    default: periodText = '无限制';
+                }
+
+                return `
+                    <tr>
+                        <td><input type="checkbox" class="user-checkbox" value="${user.username}" onchange="updateSelectedCount()"></td>
+                        <td>${user.username}</td>
+                        <td>${user.group_name || '-'}</td>
+                        <td>${periodText}</td>
+                        <td>${quotaMB > 0 ? quotaMB.toFixed(0) : '∞'}</td>
+                        <td>
+                            <div style="display: flex; flex-direction: column; gap: 4px;">
+                                <span style="font-weight: bold; color: ${quotaUsed >= quotaMB ? '#dc3545' : '#28a745'}">${totalUsed.toFixed(2)}</span>
+                                <small style="color: #6c757d;">总流量</small>
+                            </div>
+                        </td>
+                        <td>
+                            <div style="display: flex; flex-direction: column; gap: 4px;">
+                                <span style="font-weight: bold; color: ${quotaUsed > 0 ? '#007bff' : '#6c757d'}">${quotaUsed.toFixed(2)}</span>
+                                <small style="color: #6c757d;">周期内</small>
+                            </div>
+                        </td>
+                        <td>
+                            <div class="progress-bar" style="width: 100px; margin: 0;">
+                                <div class="progress-fill" style="width: ${usagePercent}%;"></div>
+                            </div>
+                            <small>${usagePercent}%</small>
+                        </td>
+                        <td>${statusBadge}</td>
+                        <td>${quotaInfo.quota_start_time ? formatDate(quotaInfo.quota_start_time) : '-'}</td>
+                        <td>
+                            <button class="btn btn-warning" onclick="editUserQuota('${user.username}')" style="padding: 5px 10px; font-size: 12px;">✏️ 编辑</button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        // 应用筛选
+        function applyFilters() {
+            const search = document.getElementById('searchUsername').value.toLowerCase();
+            const quotaType = document.getElementById('filterQuotaType').value;
+            const status = document.getElementById('filterStatus').value;
+
+            console.log('[筛选] 开始筛选，allUsers 长度:', allUsers.length);
+            console.log('[筛选] 筛选条件:', { search, quotaType, status });
+
+            let filtered = [...allUsers]; // 创建副本，避免修改原数组
+
+            // 用户名搜索
+            if (search) {
+                filtered = filtered.filter(u => u.username.toLowerCase().includes(search));
+                console.log('[筛选] 用户名搜索后:', filtered.length);
+            }
+
+            // 配额类型筛选
+            if (quotaType) {
+                if (quotaType === 'unlimited') {
+                    filtered = filtered.filter(u => !u.quota_bytes || u.quota_bytes === 0);
+                } else if (quotaType === 'custom') {
+                    filtered = filtered.filter(u => u.quota_period === 'custom');
+                }
+                console.log('[筛选] 配额类型筛选后:', filtered.length);
+            }
+
+            // 状态筛选
+            if (status) {
+                filtered = filtered.filter(u => {
+                    const quotaMB = u.quota_bytes ? u.quota_bytes / 1024 / 1024 : 0;
+                    const quotaUsed = (u.quota_used || 0) / 1024 / 1024;
+                    const percent = quotaMB > 0 ? (quotaUsed / quotaMB * 100) : 0;
+                    
+                    // 检查是否到期（针对自定义时间段）
+                    const isExpired = u.quota_end_time && u.quota_end_time > 0 && 
+                                     Date.now() > u.quota_end_time * 1000;
+
+                    if (status === 'normal') {
+                        // 正常：无限制 OR (有限制且使用率 < 80% 且未到期)
+                        return quotaMB === 0 || (percent < 80 && !isExpired);
+                    }
+                    if (status === 'warning') {
+                        // 即将超额：有限制且 80% <= 使用率 < 100% 且未到期
+                        return quotaMB > 0 && percent >= 80 && percent < 100 && !isExpired;
+                    }
+                    if (status === 'exceeded') {
+                        // 已超额：有限制且使用率 >= 100%
+                        return quotaMB > 0 && percent >= 100;
+                    }
+                    if (status === 'expired') {
+                        // 已到期：自定义时间段且已到期
+                        return isExpired;
+                    }
+                    return true;
+                });
+                console.log('[筛选] 状态筛选后:', filtered.length);
+            }
+
+            console.log('[筛选] 最终结果:', filtered.length);
+            renderQuotaTable(filtered);
+        }
+
+        // 重置筛选
+        function resetFilters() {
+            document.getElementById('searchUsername').value = '';
+            document.getElementById('filterQuotaType').value = '';
+            document.getElementById('filterStatus').value = '';
+            renderQuotaTable(allUsers);
+        }
+
+        // 编辑用户配额
+        function editUserQuota(username) {
+            const user = allUsers.find(u => u.username === username);
+            if (!user) return;
+
+            const used = { upload: user.upload_total || 0, download: user.download_total || 0 };
+            const totalUsed = ((used.upload + used.download) / 1024 / 1024).toFixed(2);
+
+            document.getElementById('editUsername').value = username;
+            document.getElementById('editUsernameDisplay').value = username;
+            document.getElementById('editQuotaPeriod').value = user.quota_period || 'unlimited';
+            document.getElementById('editQuotaBytes').value = user.quota_bytes ? (user.quota_bytes / 1024 / 1024) : 0;
+            document.getElementById('editUsedDisplay').textContent = `${totalUsed} MB`;
+
+            if (user.quota_period === 'custom') {
+                document.getElementById('customTimeFields').style.display = 'block';
+                // 转换时间戳为文本格式（YYYY-MM-DD HH:mm）
+                if (user.quota_start_time && user.quota_start_time > 0) {
+                    // 确保是毫秒级时间戳
+                    const startTimeMs = user.quota_start_time > 1000000000000 ? user.quota_start_time : user.quota_start_time * 1000;
+                    const startDate = new Date(startTimeMs);
+                    // 格式化为 YYYY-MM-DD HH:mm
+                    const year = startDate.getFullYear();
+                    const month = String(startDate.getMonth() + 1).padStart(2, '0');
+                    const day = String(startDate.getDate()).padStart(2, '0');
+                    const hours = String(startDate.getHours()).padStart(2, '0');
+                    const minutes = String(startDate.getMinutes()).padStart(2, '0');
+                    const startTime = `${year}-${month}-${day} ${hours}:${minutes}`;  // 使用空格而不是 T
+                    document.getElementById('editStartTime').value = startTime;
+                    console.log('开始时间:', startTime, '时间戳:', user.quota_start_time);
+                } else {
+                    console.log('警告：quota_start_time 为空或为 0');
+                }
+                if (user.quota_end_time && user.quota_end_time > 0) {
+                    // 确保是毫秒级时间戳
+                    const endTimeMs = user.quota_end_time > 1000000000000 ? user.quota_end_time : user.quota_end_time * 1000;
+                    const endDate = new Date(endTimeMs);
+                    // 格式化为 YYYY-MM-DD HH:mm
+                    const year = endDate.getFullYear();
+                    const month = String(endDate.getMonth() + 1).padStart(2, '0');
+                    const day = String(endDate.getDate()).padStart(2, '0');
+                    const hours = String(endDate.getHours()).padStart(2, '0');
+                    const minutes = String(endDate.getMinutes()).padStart(2, '0');
+                    const endTime = `${year}-${month}-${day} ${hours}:${minutes}`;  // 使用空格而不是 T
+                    document.getElementById('editEndTime').value = endTime;
+                    console.log('结束时间:', endTime, '时间戳:', user.quota_end_time);
+                } else {
+                    console.log('警告：quota_end_time 为空或为 0');
+                }
+            } else {
+                document.getElementById('customTimeFields').style.display = 'none';
+            }
+
+            // ✅ 调用 toggleEditTimeFields 初始化配额输入框状态
+            toggleEditTimeFields();
+
+            document.getElementById('editQuotaModal').style.display = 'block';
+        }
+
+        // 切换时间字段显示
+        function toggleEditTimeFields() {
+            const period = document.getElementById('editQuotaPeriod').value;
+            const timeFields = document.getElementById('customTimeFields');
+            const quotaInput = document.getElementById('editQuotaBytes');
+            const quotaGroup = quotaInput.closest('.form-group'); // 获取整个表单组
+            
+            // 显示/隐藏时间选择框
+            timeFields.style.display = period === 'custom' ? 'block' : 'none';
+            
+            // ✅ 当选择"无限制"时，隐藏流量配额输入框
+            if (period === 'unlimited') {
+                quotaInput.value = 0;
+                quotaInput.disabled = true;
+                quotaGroup.style.display = 'none'; // 隐藏整个表单组
+            } else {
+                quotaInput.disabled = false;
+                quotaGroup.style.display = 'block'; // 显示表单组
+            }
+        }
+
+        // 保存编辑
+        document.getElementById('editQuotaForm').onsubmit = async function(e) {
+            e.preventDefault();
+            
+            const username = document.getElementById('editUsername').value;
+            const period = document.getElementById('editQuotaPeriod').value;
+            const quotaMB = parseFloat(document.getElementById('editQuotaBytes').value);
+            const quotaBytes = quotaMB * 1024 * 1024;
+            
+            // 构建后端期望的请求格式
+            const payload = {
+                usernames: [username],
+                trafficQuota: {
+                    Period: period,
+                    QuotaBytes: quotaBytes
+                }
+            };
+
+            // 如果是自定义时间段，添加时间范围
+            if (period === 'custom') {
+                const startTime = document.getElementById('editStartTime').value;
+                const endTime = document.getElementById('editEndTime').value;
+                if (startTime && endTime) {
+                    // 将 YYYY-MM-DD HH:mm 格式转换为 RFC3339 格式
+                    const startRFC3339 = startTime.replace(' ', 'T') + ':00+08:00';
+                    const endRFC3339 = endTime.replace(' ', 'T') + ':00+08:00';
+                    
+                    payload.trafficQuota.StartTime = startRFC3339;
+                    payload.trafficQuota.EndTime = endRFC3339;
+                    
+                    console.log('保存时间:', {
+                        startTime: startRFC3339,
+                        endTime: endRFC3339
+                    });
+                } else {
+                    alert('❌ 请选择开始和结束时间');
+                    return;
+                }
+            }
+
+            console.log('发送请求到 /api/admin/batch-set-quota');
+            console.log('请求数据:', JSON.stringify(payload, null, 2));
+
+            try {
+                const response = await fetch('/api/admin/batch-set-quota', {
+                    method: 'POST',
+                    headers: {
+                        ...getAuthHeaders(),
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                // 检查是否是 401 未授权
+                if (response.status === 401) {
+                    console.error('会话已过期，跳转到登录页');
+                    alert('⚠ 登录已过期，请重新登录');
+                    localStorage.removeItem('authToken');
+                    localStorage.removeItem('adminToken');
+                    window.location.href = '/login.html';
+                    return;
+                }
+
+                // 检查是否是其他错误状态
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error('请求失败:', response.status, errorText);
+                    alert('❌ 设置失败：' + (errorText || response.statusText));
+                    return;
+                }
+
+                const result = await response.json();
+                console.log('响应数据:', result);
+                
+                if (result.success) {
+                    alert('✅ ' + result.message);
+                    closeModal('editQuotaModal');
+                    loadQuotaTable();
+                    loadQuotaStats();
+                } else {
+                    alert('❌ ' + (result.message || '设置失败'));
+                }
+            } catch (error) {
+                console.error('设置配额失败:', error);
+                alert('❌ 网络错误：' + error.message);
+            }
+        };
+
+        // 批量设置相关
+        function showBatchSetModal() {
+            const checkboxes = document.querySelectorAll('.user-checkbox:checked');
+            if (checkboxes.length === 0) {
+                alert('请先勾选要设置的用户');
+                return;
+            }
+
+            selectedUsers.clear();
+            checkboxes.forEach(cb => selectedUsers.add(cb.value));
+
+            updateSelectedCount();
+            
+            // ✅ 初始化配额类型选择，默认选中第一个选项
+            const periodSelect = document.getElementById('batchQuotaPeriod');
+            periodSelect.value = 'custom'; // 默认选择自定义时间段
+            
+            // ✅ 初始化日期选择器显示状态
+            toggleBatchTimeFields();
+            
+            // ✅ 初始化日期选择器（如果还未初始化）
+            if (!window.batchFlatpickrInitialized) {
+                flatpickr('#batchStartTime', {
+                    enableTime: true,
+                    dateFormat: 'Y-m-d H:i',
+                    locale: 'zh'
+                });
+                flatpickr('#batchEndTime', {
+                    enableTime: true,
+                    dateFormat: 'Y-m-d H:i',
+                    locale: 'zh'
+                });
+                window.batchFlatpickrInitialized = true;
+            }
+            
+            document.getElementById('batchSetModal').style.display = 'block';
+        }
+
+        function updateSelectedCount() {
+            const checkboxes = document.querySelectorAll('.user-checkbox:checked');
+            document.getElementById('selectedCount').textContent = checkboxes.length;
+
+            const listDiv = document.getElementById('selectedUsersList');
+            if (checkboxes.length === 0) {
+                listDiv.textContent = '请先在列表中勾选用户';
+            } else {
+                listDiv.innerHTML = Array.from(selectedUsers)
+                    .map(u => `<div style="padding: 3px 0;">👤 ${u}</div>`)
+                    .join('');
+            }
+        }
+
+        function toggleBatchTimeFields() {
+            const period = document.getElementById('batchQuotaPeriod').value;
+            const batchTimeFields = document.getElementById('batchTimeFields');
+            const batchQuotaInput = document.getElementById('batchQuotaBytes');
+            const batchQuotaGroup = batchQuotaInput.closest('.form-group'); // 获取整个表单组
+            
+            // 显示/隐藏时间选择框
+            batchTimeFields.style.display = period === 'custom' ? 'block' : 'none';
+            
+            // ✅ 当选择"无限制"时，隐藏流量配额输入框
+            if (period === 'unlimited') {
+                batchQuotaInput.value = 0;
+                batchQuotaInput.disabled = true;
+                batchQuotaGroup.style.display = 'none'; // 隐藏整个表单组
+            } else {
+                batchQuotaInput.disabled = false;
+                batchQuotaGroup.style.display = 'block'; // 显示表单组
+            }
+        }
+
+        document.getElementById('batchSetForm').onsubmit = async function(e) {
+            e.preventDefault();
+
+            const period = document.getElementById('batchQuotaPeriod').value;
+            const quotaBytes = parseFloat(document.getElementById('batchQuotaBytes').value) * 1024 * 1024;
+
+            // ✅ 修复：使用正确的数据结构，匹配后端期望的 trafficQuota 嵌套结构
+            const payload = {
+                usernames: Array.from(selectedUsers),
+                trafficQuota: {
+                    Period: period,
+                    QuotaBytes: quotaBytes
+                }
+            };
+
+            if (period === 'custom') {
+                const startTime = document.getElementById('batchStartTime').value;
+                const endTime = document.getElementById('batchEndTime').value;
+                if (startTime && endTime) {
+                    // Flatpickr 返回的格式是 YYYY-MM-DD HH:mm，需要转换为时间戳
+                    const startTimestamp = new Date(startTime).getTime() / 1000;
+                    const endTimestamp = new Date(endTime).getTime() / 1000;
+                    
+                    // 验证时间戳有效性
+                    if (isNaN(startTimestamp) || isNaN(endTimestamp)) {
+                        alert('❌ 时间格式错误，请选择有效的日期和时间');
+                        return;
+                    }
+                    
+                    // ✅ 将时间戳添加到 trafficQuota 对象中
+                    payload.trafficQuota.StartTime = startTimestamp.toString();
+                    payload.trafficQuota.EndTime = endTimestamp.toString();
+                    
+                    console.log('批量保存时间戳:', {
+                        start: startTimestamp,
+                        end: endTimestamp,
+                        startTime: startTime,
+                        endTime: endTime
+                    });
+                } else {
+                    alert('❌ 请选择开始和结束时间');
+                    return;
+                }
+            }
+
+            console.log('[批量设置] 发送请求到 /api/admin/batch-set-quota');
+            console.log('[批量设置] 请求数据:', JSON.stringify(payload, null, 2));
+
+            try {
+                const response = await fetch('/api/admin/batch-set-quota', {
+                    method: 'POST',
+                    headers: {
+                        ...getAuthHeaders(),
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                // 检查是否是 401 未授权
+                if (response.status === 401) {
+                    console.error('[批量设置] 会话已过期，跳转到登录页');
+                    alert('⚠ 登录已过期，请重新登录');
+                    localStorage.removeItem('authToken');
+                    localStorage.removeItem('adminToken');
+                    window.location.href = '/login.html';
+                    return;
+                }
+
+                // 检查是否是其他错误状态
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error('[批量设置] 请求失败:', response.status, errorText);
+                    alert('❌ 设置失败：' + (errorText || response.statusText));
+                    return;
+                }
+
+                const result = await response.json();
+                console.log('[批量设置] 响应数据:', result);
+                
+                if (result.success) {
+                    alert('✅ ' + result.message);
+                    closeModal('batchSetModal');
+                    
+                    // ✅ 重置选择状态
+                    document.getElementById('selectAll').checked = false;
+                    selectedUsers.clear();
+                    
+                    loadQuotaTable();
+                    loadQuotaStats();
+                } else {
+                    alert('❌ ' + (result.message || '批量设置失败'));
+                }
+            } catch (error) {
+                console.error('[批量设置] 失败:', error);
+                alert('❌ 网络错误：' + error.message);
+            }
+        };
+
+        // 辅助函数
+        function closeModal(modalId) {
+            document.getElementById(modalId).style.display = 'none';
+        }
+
+        function toggleSelectAll() {
+            const selectAll = document.getElementById('selectAll');
+            const checkboxes = document.querySelectorAll('.user-checkbox');
+            checkboxes.forEach(cb => cb.checked = selectAll.checked);
+            updateSelectedCount();
+        }
+
+        // 格式化日期时间（处理秒级时间戳）
+        function formatDate(dateStr) {
+            if (!dateStr && dateStr !== 0) return '-';
+            
+            // 如果是数字（秒级时间戳），转换为毫秒
+            let timestamp = dateStr;
+            if (typeof dateStr === 'number') {
+                // 如果数值小于 10000000000，说明是秒级时间戳，转换为毫秒
+                if (dateStr < 10000000000) {
+                    timestamp = dateStr * 1000;
+                }
+            }
+            
+            const date = new Date(timestamp);
+            // 检查日期是否有效
+            if (isNaN(date.getTime())) {
+                return '-';
+            }
+            return date.toLocaleString('zh-CN');
+        }
+
+        // 点击模态框外部关闭
+        window.onclick = function(event) {
+            if (event.target.classList.contains('modal')) {
+                event.target.style.display = 'none';
+            }
+        }
+    </script>
+    
+    <!-- Flatpickr 时间选择器 JS -->
+    <script src="/static/lib/flatpickr.min.js"></script>
+    <script src="/static/lib/zh.js"></script>
+    <script>
+        // 初始化时间选择器
+        document.addEventListener('DOMContentLoaded', function() {
+            // 编辑配额时间选择器
+            const editStartTimePicker = flatpickr('#editStartTime', {
+                enableTime: true,
+                dateFormat: 'Y-m-d H:i',
+                time_24hr: true,
+                locale: 'zh',
+                minDate: 'today',
+                defaultHour: 12,
+                defaultMinute: 0
+            });
+            
+            const editEndTimePicker = flatpickr('#editEndTime', {
+                enableTime: true,
+                dateFormat: 'Y-m-d H:i',
+                time_24hr: true,
+                locale: 'zh',
+                minDate: 'today',
+                defaultHour: 18,
+                defaultMinute: 0
+            });
+            
+            // 批量设置时间选择器
+            const batchStartTimePicker = flatpickr('#batchStartTime', {
+                enableTime: true,
+                dateFormat: 'Y-m-d H:i',
+                time_24hr: true,
+                locale: 'zh',
+                minDate: 'today',
+                defaultHour: 12,
+                defaultMinute: 0
+            });
+            
+            const batchEndTimePicker = flatpickr('#batchEndTime', {
+                enableTime: true,
+                dateFormat: 'Y-m-d H:i',
+                time_24hr: true,
+                locale: 'zh',
+                minDate: 'today',
+                defaultHour: 18,
+                defaultMinute: 0
+            });
+            
+            console.log('✅ 时间选择器初始化完成');
+        });
+    </script>
+</body>
+</html>
