@@ -1,180 +1,58 @@
-// =============================================================================
-// 文件名：auth.go
-// 描述：SOCKS5 服务器认证与用户管理模块
-// 功能：
-//   - 密码哈希加密（bcrypt）
-//   - 用户名/密码验证
-//   - 用户管理（添加、删除、更新）
-//   - 连接数限制（用户级/IP 级）
-//   - 流量配额控制（自定义时间段、周期性配额）
-//   - 速度限制（上传/下载分别控制）
-//   - 分片优化（ShardedPasswordAuth，超高并发场景）
-// 安全特性：
-//   - bcrypt 密码哈希（成本系数 10）
-//   - constant-time 比较（防时序攻击）
-//   - 即使用户不存在也进行虚假比较（防枚举攻击）
-// =============================================================================
-
 package main
 
 import (
-	// 常量时间比较，防止时序攻击
-	"encoding/json" // JSON 序列化
-	"fmt"           // 格式化输出
-	"log"           // 日志记录
-	"regexp"        // 正则表达式
-	"sync"          // 同步原语
-	"sync/atomic"   // 原子操作
-	"time"          // 时间处理
-	"unicode"       // Unicode 字符分类
+	"encoding/json"
+	"fmt"
+	"log"
+	"regexp"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode"
 
-	// 字符串处理
-	"golang.org/x/crypto/bcrypt" // 密码哈希加密
+	"golang.org/x/crypto/bcrypt"
 )
 
-// =============================================================================
-// 安全常量定义
-//
-// 用途：设置系统的安全限制参数，防止滥用和攻击
-// =============================================================================
 const (
-	// --- 用户名限制 ---
-	// 最小用户名长度：防止过短的用户名（难以识别和管理）
 	MinUsernameLen = 3
-
-	// 最大用户名长度：防止过长的用户名（浪费存储空间）
 	MaxUsernameLen = 32
-
-	// --- 密码限制 ---
-	// 最小密码长度：保证基本的安全性（8 位是行业最低标准）
 	MinPasswordLen = 8
-
-	// 最大密码长度：防止超长密码（可能是攻击行为）
 	MaxPasswordLen = 128
-
-	// --- 速度限制 ---
-	// 最大速度限制：10GB/s（防止配置错误导致系统异常）
-	MaxSpeedLimit = 10 * 1024 * 1024 * 1024
-
-	// --- 连接数限制 ---
-	// 最大连接数限制：100000（单用户最大连接上限）
+	MaxSpeedLimit  = 10 * 1024 * 1024 * 1024
 	MaxConnections = 100000
 )
 
-// =============================================================================
-// usernameRegex - 用户名验证正则表达式
-//
-// 规则：只允许字母 (a-z, A-Z)、数字 (0-9)、下划线 (_)、短横线 (-)
-// 说明：
-// - ^ 表示字符串开始
-// - [a-zA-Z0-9_-]+ 表示一个或多个允许的字符
-// - $ 表示字符串结束
-//
-// 示例：
-// - 有效："user123", "admin_01", "test-user"
-// - 无效："user@123", "admin#1", "中文用户"
-// =============================================================================
 var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
-// hashPassword 对密码进行 bcrypt 哈希处理
-//
-// 参数 password: 原始密码（明文）
-// 返回：(string, error) - 哈希后的密码和可能的错误
-//
-// 参数说明：
-// - cost: 加密成本系数（范围 4-31）
-//   - 4-9:   快速但不安全（不推荐）
-//   - 10:    默认值，平衡安全性和性能（推荐）
-//   - 11-14: 更安全但较慢（适合高安全场景）
-//   - 15+:   非常慢（通常不需要）
-//
-// bcrypt 算法特点：
-// - 自适应：可以调整 cost 参数应对硬件进步
-// - 加盐：自动生成随机盐值，防止彩虹表攻击
-// - 慢速：故意设计为计算密集型，增加暴力破解难度
-//
-// 使用示例：
-//
-//	hashed, err := hashPassword("mypassword123")
-//	if err != nil {
-//	    log.Printf("密码哈希失败：%v", err)
-//	}
 func hashPassword(password string) (string, error) {
-	// 使用 bcrypt.DefaultCost (10) 平衡安全性和性能
-	// GenerateFromPassword 会自动生成随机盐值
 	hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		// 包装错误信息，便于调试
 		return "", fmt.Errorf("密码哈希失败：%w", err)
 	}
-	// 将字节切片转换为字符串返回
 	return string(hashed), nil
 }
 
-// checkPasswordHash 验证密码是否匹配哈希值
-//
-// 参数 password: 原始密码（明文）
-// 参数 hash: bcrypt 哈希值
-// 返回：bool - true=匹配，false=不匹配
-//
-// 安全特性：
-// 1. constant-time 比较：
-//   - 比较时间固定，不提前退出
-//   - 防止时序攻击（通过比较时间推断密码）
-//
-// 2. 即使用户不存在也进行虚假比较：
-//   - 调用 bcrypt.CompareHashAndPassword 即使 hash 无效
-//   - 消耗相同时间，防止枚举攻击（判断用户是否存在）
-//
-// 使用示例：
-//
-//	if checkPasswordHash("mypassword", hashed) {
-//	    log.Println("密码验证成功")
-//	} else {
-//	    log.Println("密码验证失败")
-//	}
 func checkPasswordHash(password, hash string) bool {
-	// CompareHashAndPassword 内部已实现 constant-time 比较
 	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
-	// 返回 true 表示匹配（err == nil）
 	return err == nil
 }
 
-// validateUsername 验证用户名格式
-//
-// 参数 username: 要验证的用户名
-// 返回：error - 验证失败返回错误，成功返回 nil
-//
-// 验证规则：
-// 1. 长度检查：3-32 位
-// 2. 字符检查：只允许字母、数字、下划线、短横线
-//
-// 错误信息：
-// - "用户名长度至少为 3 位"
-// - "用户名长度不能超过 32 位"
-// - "用户名只能包含字母、数字、下划线和短横线"
 func validateUsername(username string) error {
-	// 检查最小长度
 	if len(username) < MinUsernameLen {
 		return fmt.Errorf("用户名长度至少为 %d 位", MinUsernameLen)
 	}
 
-	// 检查最大长度
 	if len(username) > MaxUsernameLen {
 		return fmt.Errorf("用户名长度不能超过 %d 位", MaxUsernameLen)
 	}
 
-	// 检查字符合法性（使用正则表达式）
 	if !usernameRegex.MatchString(username) {
 		return fmt.Errorf("用户名只能包含字母、数字、下划线和短横线")
 	}
 
-	// 验证通过
 	return nil
 }
 
-// validatePassword 验证密码强度
-// 规则：8-128 位，必须包含字母和数字
 func validatePassword(password string) error {
 	if len(password) < MinPasswordLen {
 		return fmt.Errorf("密码长度至少为 %d 位", MinPasswordLen)
@@ -201,7 +79,6 @@ func validatePassword(password string) error {
 	return nil
 }
 
-// validateSpeedLimit 验证速度限制值
 func validateSpeedLimit(limit int64) (int64, error) {
 	if limit < 0 {
 		return 0, fmt.Errorf("速度限制不能为负数")
@@ -212,7 +89,6 @@ func validateSpeedLimit(limit int64) (int64, error) {
 	return limit, nil
 }
 
-// validateMaxConnections 验证最大连接数
 func validateMaxConnections(maxConn int) (int, error) {
 	if maxConn < 0 {
 		return 0, fmt.Errorf("最大连接数不能为负数")
@@ -223,52 +99,43 @@ func validateMaxConnections(maxConn int) (int, error) {
 	return maxConn, nil
 }
 
-// Authenticator 认证器接口，定义了认证必须实现的方法
 type Authenticator interface {
-	// Authenticate 验证用户名和密码，返回是否验证成功
 	Authenticate(username, password string) bool
-	// Method 返回认证方法常量（用于 SOCKS5 协议协商）
 	Method() byte
 }
 
-// NoAuth 无需认证的实现，总是允许连接
 type NoAuth struct{}
 
 func (a *NoAuth) Authenticate(username, password string) bool {
-	return true // 总是认证成功
+	return true
 }
 
 func (a *NoAuth) Method() byte {
-	return AuthNone // 返回无认证方法标识
+	return AuthNone
 }
 
-// User 用户信息结构体（32 位系统优化版：int64 字段放在开头确保 8 字节对齐）
 type User struct {
-	// int64 字段必须放在最前面，确保 8 字节对齐（32 位系统原子操作要求）
-	ReadSpeedLimit  int64 `json:"read_speed_limit"`  // 读取速度限制（字节/秒）
-	WriteSpeedLimit int64 `json:"write_speed_limit"` // 写入速度限制（字节/秒）
-	UploadTotal     int64 `json:"upload_total"`      // 总上传流量（字节）
-	DownloadTotal   int64 `json:"download_total"`    // 总下载流量（字节）
-	CreateTime      int64 `json:"create_time"`       // 创建时间戳
-	LastActivity    int64 `json:"last_activity"`     // 最后活动时间戳
-	QuotaBytes      int64 `json:"quota_bytes"`       // 周期流量配额（字节）
-	QuotaUsed       int64 `json:"quota_used"`        // 当前周期已用流量（字节）
-	QuotaResetTime  int64 `json:"quota_reset_time"`  // 下次流量重置时间戳
-	QuotaStartTime  int64 `json:"quota_start_time"`  // 配额周期开始时间戳
-	QuotaEndTime    int64 `json:"quota_end_time"`    // 配额周期结束时间戳
+	ReadSpeedLimit  int64 `json:"read_speed_limit"`
+	WriteSpeedLimit int64 `json:"write_speed_limit"`
+	UploadTotal     int64 `json:"upload_total"`
+	DownloadTotal   int64 `json:"download_total"`
+	CreateTime      int64 `json:"create_time"`
+	LastActivity    int64 `json:"last_activity"`
+	QuotaBytes      int64 `json:"quota_bytes"`
+	QuotaUsed       int64 `json:"quota_used"`
+	QuotaResetTime  int64 `json:"quota_reset_time"`
+	QuotaStartTime  int64 `json:"quota_start_time"`
+	QuotaEndTime    int64 `json:"quota_end_time"`
 
-	// 其他字段
-	Username         string `json:"username"`           // 用户名
-	Password         string `json:"password"`           // 密码
-	MaxConnections   int    `json:"max_connections"`    // 最大连接数
-	Enabled          bool   `json:"enabled"`            // 是否启用
-	QuotaPeriod      string `json:"quota_period"`       // 流量周期 (custom)
-	MaxIPConnections int    `json:"max_ip_connections"` // 单用户最大 IP 连接数
+	Username         string `json:"username"`
+	Password         string `json:"password"`
+	MaxConnections   int    `json:"max_connections"`
+	Enabled          bool   `json:"enabled"`
+	QuotaPeriod      string `json:"quota_period"`
+	MaxIPConnections int    `json:"max_ip_connections"`
 }
 
-// MarshalJSON 实现自定义 JSON 序列化（确保读取原子值，防止序列化时读取到过时的值）
 func (u *User) MarshalJSON() ([]byte, error) {
-	// 创建辅助类型避免递归调用 MarshalJSON
 	type Alias User
 	return json.Marshal(&struct {
 		UploadTotal   int64 `json:"upload_total"`
@@ -277,33 +144,28 @@ func (u *User) MarshalJSON() ([]byte, error) {
 		LastActivity  int64 `json:"last_activity"`
 		*Alias
 	}{
-		UploadTotal:   atomic.LoadInt64(&u.UploadTotal),   // 读取原子值
-		DownloadTotal: atomic.LoadInt64(&u.DownloadTotal), // 读取原子值
-		QuotaUsed:     atomic.LoadInt64(&u.QuotaUsed),     // 读取原子值
-		LastActivity:  atomic.LoadInt64(&u.LastActivity),  // 读取原子值
+		UploadTotal:   atomic.LoadInt64(&u.UploadTotal),
+		DownloadTotal: atomic.LoadInt64(&u.DownloadTotal),
+		QuotaUsed:     atomic.LoadInt64(&u.QuotaUsed),
+		LastActivity:  atomic.LoadInt64(&u.LastActivity),
 		Alias:         (*Alias)(u),
 	})
 }
 
-// PasswordAuth 用户名/密码认证实现，支持多用户管理（万兆性能优化版）
-// 使用分片 map 减少锁竞争，提升并发性能
 type PasswordAuth struct {
-	mu              sync.RWMutex               // 读写锁，保护并发访问
-	users           map[string]*User           // 用户名到用户信息的映射
-	userConnections map[string]int             // 每个用户的当前连接数
-	connMu          sync.RWMutex               // 保护 userConnections 的锁
-	userIPs         map[string]map[string]bool // 每个用户的 IP 地址集合 {username: {ip: true}}
-	ipMu            sync.RWMutex               // 保护 userIPs 的锁
+	mu              sync.RWMutex
+	users           map[string]*User
+	userConnections map[string]int
+	connMu          sync.RWMutex
+	userIPs         map[string]map[string]bool
+	ipMu            sync.RWMutex
 }
 
-// ShardedPasswordAuth 分片密码认证器（万兆极致性能版）
-// 使用 16 个分片 map 减少锁竞争，适合超高并发场景
 type ShardedPasswordAuth struct {
-	shards     [16]*PasswordAuth // 16 个分片
-	shardCount int               // 分片数量
+	shards     [16]*PasswordAuth
+	shardCount int
 }
 
-// NewShardedPasswordAuth 创建分片密码认证器（万兆优化）
 func NewShardedPasswordAuth() *ShardedPasswordAuth {
 	sa := &ShardedPasswordAuth{
 		shardCount: 16,
@@ -314,7 +176,6 @@ func NewShardedPasswordAuth() *ShardedPasswordAuth {
 	return sa
 }
 
-// getShard 根据用户名获取对应的分片（使用 hash 取模）
 func (sa *ShardedPasswordAuth) getShard(username string) *PasswordAuth {
 	hash := 0
 	for _, c := range username {
@@ -326,38 +187,31 @@ func (sa *ShardedPasswordAuth) getShard(username string) *PasswordAuth {
 	return sa.shards[hash%sa.shardCount]
 }
 
-// AddUser 添加用户（分片版本）
 func (sa *ShardedPasswordAuth) AddUser(username, password string) error {
 	return sa.getShard(username).AddUser(username, password)
 }
 
-// GetUser 获取用户（分片版本）
 func (sa *ShardedPasswordAuth) GetUser(username string) (*User, bool) {
 	return sa.getShard(username).GetUser(username)
 }
 
-// Authenticate 认证用户（分片版本）
 func (sa *ShardedPasswordAuth) Authenticate(username, password string) bool {
 	return sa.getShard(username).Authenticate(username, password)
 }
 
-// NewPasswordAuth 创建并初始化密码认证器实例
 func NewPasswordAuth() *PasswordAuth {
 	return &PasswordAuth{
-		users:           make(map[string]*User),           // 初始化用户 map
-		userConnections: make(map[string]int),             // 初始化连接数 map
-		userIPs:         make(map[string]map[string]bool), // 初始化 IP 集合
+		users:           make(map[string]*User),
+		userConnections: make(map[string]int),
+		userIPs:         make(map[string]map[string]bool),
 	}
 }
 
-// AddUser 添加或更新用户凭据（安全版：密码哈希存储 + 输入验证）
 func (a *PasswordAuth) AddUser(username, password string) error {
-	// ✅ 验证用户名格式
 	if err := validateUsername(username); err != nil {
 		return fmt.Errorf("用户名验证失败：%w", err)
 	}
 
-	// ✅ 验证密码强度
 	if err := validatePassword(password); err != nil {
 		return fmt.Errorf("密码验证失败：%w", err)
 	}
@@ -365,7 +219,6 @@ func (a *PasswordAuth) AddUser(username, password string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// 对密码进行 bcrypt 哈希处理
 	hashedPassword, err := hashPassword(password)
 	if err != nil {
 		log.Printf("用户 [%s] 密码哈希失败：%v", username, err)
@@ -374,10 +227,10 @@ func (a *PasswordAuth) AddUser(username, password string) error {
 
 	a.users[username] = &User{
 		Username:        username,
-		Password:        hashedPassword, // ✅ 存储哈希值而非明文
-		ReadSpeedLimit:  0,              // 默认不限速
-		WriteSpeedLimit: 0,              // 默认不限速
-		MaxConnections:  0,              // 默认不限连接数
+		Password:        hashedPassword,
+		ReadSpeedLimit:  0,
+		WriteSpeedLimit: 0,
+		MaxConnections:  0,
 		Enabled:         true,
 		CreateTime:      time.Now().Unix(),
 		LastActivity:    time.Now().Unix(),
@@ -387,16 +240,13 @@ func (a *PasswordAuth) AddUser(username, password string) error {
 	return nil
 }
 
-// RemoveUser 删除指定用户
 func (a *PasswordAuth) RemoveUser(username string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.users, username)
 }
 
-// UpdateUserPassword 更新用户密码（安全版：bcrypt 哈希）
 func (a *PasswordAuth) UpdateUserPassword(username, newPassword string) bool {
-	// ✅ 空指针检查
 	if a == nil {
 		log.Printf("错误：PasswordAuth 为 nil")
 		return false
@@ -410,7 +260,6 @@ func (a *PasswordAuth) UpdateUserPassword(username, newPassword string) bool {
 		return false
 	}
 
-	// 对新密码进行 bcrypt 哈希处理
 	hashedPassword, err := hashPassword(newPassword)
 	if err != nil {
 		log.Printf("用户 [%s] 密码哈希失败：%v", username, err)
@@ -422,30 +271,23 @@ func (a *PasswordAuth) UpdateUserPassword(username, newPassword string) bool {
 	return true
 }
 
-// Authenticate 验证用户名和密码（安全版：bcrypt 密码验证）
-// 使用 constant-time 比较防止时序攻击（timing attack）
 func (a *PasswordAuth) Authenticate(username, password string) bool {
 	a.mu.RLock()
 	user, exists := a.users[username]
 	a.mu.RUnlock()
 
 	if !exists || !user.Enabled {
-		// 为了防止时序攻击，即使用户不存在也进行虚假比较
-		// 这样攻击者无法通过响应时间判断用户是否存在
 		_ = checkPasswordHash(password, "")
 		return false
 	}
 
-	// ✅ 使用 bcrypt 验证哈希密码
-	// bcrypt.CompareHashAndPassword 内部已实现 constant-time 比较
 	return checkPasswordHash(password, user.Password)
 }
 
 func (a *PasswordAuth) Method() byte {
-	return AuthPassword // 返回密码认证方法标识
+	return AuthPassword
 }
 
-// SetUserSpeedLimit 设置用户的速度限制
 func (a *PasswordAuth) SetUserSpeedLimit(username string, readLimit, writeLimit int64) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -460,7 +302,6 @@ func (a *PasswordAuth) SetUserSpeedLimit(username string, readLimit, writeLimit 
 	return true
 }
 
-// SetUserMaxConnections 设置用户的最大连接数
 func (a *PasswordAuth) SetUserMaxConnections(username string, maxConn int) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -474,7 +315,6 @@ func (a *PasswordAuth) SetUserMaxConnections(username string, maxConn int) bool 
 	return true
 }
 
-// EnableUser 启用或禁用用户
 func (a *PasswordAuth) EnableUser(username string, enabled bool) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -488,7 +328,6 @@ func (a *PasswordAuth) EnableUser(username string, enabled bool) bool {
 	return true
 }
 
-// GetUser 获取用户信息
 func (a *PasswordAuth) GetUser(username string) (*User, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -501,7 +340,6 @@ func (a *PasswordAuth) GetUser(username string) (*User, bool) {
 	return user, true
 }
 
-// ListUsers 列出所有用户
 func (a *PasswordAuth) ListUsers() []*User {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -513,7 +351,6 @@ func (a *PasswordAuth) ListUsers() []*User {
 	return users
 }
 
-// IncrementUserConnection 增加用户连接数（原子操作）
 func (a *PasswordAuth) IncrementUserConnection(username string) int {
 	a.connMu.Lock()
 	defer a.connMu.Unlock()
@@ -525,7 +362,6 @@ func (a *PasswordAuth) IncrementUserConnection(username string) int {
 	return a.userConnections[username]
 }
 
-// DecrementUserConnection 减少用户连接数（原子操作）
 func (a *PasswordAuth) DecrementUserConnection(username string) int {
 	a.connMu.Lock()
 	defer a.connMu.Unlock()
@@ -540,7 +376,6 @@ func (a *PasswordAuth) DecrementUserConnection(username string) int {
 	return 0
 }
 
-// GetUserConnectionCount 获取用户当前连接数
 func (a *PasswordAuth) GetUserConnectionCount(username string) int {
 	a.connMu.RLock()
 	defer a.connMu.RUnlock()
@@ -551,14 +386,13 @@ func (a *PasswordAuth) GetUserConnectionCount(username string) int {
 	return a.userConnections[username]
 }
 
-// CheckUserConnectionLimit 检查用户是否超过连接数限制
 func (a *PasswordAuth) CheckUserConnectionLimit(username string) bool {
 	a.mu.RLock()
 	user, exists := a.users[username]
 	a.mu.RUnlock()
 
 	if !exists || user.MaxConnections <= 0 {
-		return true // 无限制
+		return true
 	}
 
 	a.connMu.RLock()
@@ -571,7 +405,6 @@ func (a *PasswordAuth) CheckUserConnectionLimit(username string) bool {
 	return currentConns < user.MaxConnections
 }
 
-// AddUserIP 添加用户 IP 地址
 func (a *PasswordAuth) AddUserIP(username, ip string) {
 	a.ipMu.Lock()
 	defer a.ipMu.Unlock()
@@ -585,21 +418,18 @@ func (a *PasswordAuth) AddUserIP(username, ip string) {
 	a.userIPs[username][ip] = true
 }
 
-// RemoveUserIP 移除用户 IP 地址
 func (a *PasswordAuth) RemoveUserIP(username, ip string) {
 	a.ipMu.Lock()
 	defer a.ipMu.Unlock()
 
 	if a.userIPs != nil && a.userIPs[username] != nil {
 		delete(a.userIPs[username], ip)
-		// 如果没有 IP 了，清理 map
 		if len(a.userIPs[username]) == 0 {
 			delete(a.userIPs, username)
 		}
 	}
 }
 
-// GetUserIPCount 获取用户当前连接的 IP 数量
 func (a *PasswordAuth) GetUserIPCount(username string) int {
 	a.ipMu.RLock()
 	defer a.ipMu.RUnlock()
@@ -610,33 +440,29 @@ func (a *PasswordAuth) GetUserIPCount(username string) int {
 	return len(a.userIPs[username])
 }
 
-// CheckUserIPLimit 检查用户是否超过 IP 连接数限制
 func (a *PasswordAuth) CheckUserIPLimit(username, ip string) bool {
-	// 快速获取用户信息
 	a.mu.RLock()
 	user, exists := a.users[username]
 	if !exists || user.MaxIPConnections <= 0 {
 		a.mu.RUnlock()
-		return true // 无限制
+		return true
 	}
 	a.mu.RUnlock()
 
-	// 快速获取 IP 计数
 	a.ipMu.RLock()
 	if a.userIPs == nil {
 		a.ipMu.RUnlock()
-		return true // 还没有 IP 记录
+		return true
 	}
 	ipSet := a.userIPs[username]
 	if ipSet == nil {
 		a.ipMu.RUnlock()
-		return true // 还没有 IP 记录
+		return true
 	}
 
-	// 检查 IP 是否已存在
 	if ipSet[ip] {
 		a.ipMu.RUnlock()
-		return true // 已存在，允许连接
+		return true
 	}
 
 	currentIPs := len(ipSet)
@@ -645,7 +471,6 @@ func (a *PasswordAuth) CheckUserIPLimit(username, ip string) bool {
 	return currentIPs < user.MaxIPConnections
 }
 
-// GetUserIPs 获取用户当前连接的所有 IP 地址
 func (a *PasswordAuth) GetUserIPs(username string) []string {
 	a.ipMu.RLock()
 	defer a.ipMu.RUnlock()
@@ -661,7 +486,6 @@ func (a *PasswordAuth) GetUserIPs(username string) []string {
 	return ips
 }
 
-// FindUserByIP 通过 IP 地址查找用户名（用于从连接映射丢失时恢复）
 func (a *PasswordAuth) FindUserByIP(ip string) (string, bool) {
 	a.ipMu.RLock()
 	defer a.ipMu.RUnlock()
@@ -678,7 +502,6 @@ func (a *PasswordAuth) FindUserByIP(ip string) (string, bool) {
 	return "", false
 }
 
-// SetUserMaxIPConnections 设置用户最大 IP 连接数
 func (a *PasswordAuth) SetUserMaxIPConnections(username string, maxIP int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -692,39 +515,30 @@ func (a *PasswordAuth) SetUserMaxIPConnections(username string, maxIP int) {
 	log.Printf("用户 [%s] 最大 IP 连接数已设置为：%d", username, maxIP)
 }
 
-// SelectAuthMethod 选择双方都支持的认证方法
-// 参数 clientMethods: 客户端支持的方法列表；serverMethods: 服务器支持的方法列表
-// 返回：选定的认证方法，如果没有共同支持的方法则返回 AuthNoAccept
 func SelectAuthMethod(clientMethods, serverMethods []byte) byte {
-	// 优先检查密码认证 (0x02) - 更安全
 	for _, cm := range clientMethods {
 		if cm == AuthPassword {
 			for _, sm := range serverMethods {
 				if sm == AuthPassword {
-					return AuthPassword // 找到共同支持的密码认证
+					return AuthPassword
 				}
 			}
 		}
 	}
 
-	// 其次检查无需认证 (0x00)
 	for _, cm := range clientMethods {
 		if cm == AuthNone {
 			for _, sm := range serverMethods {
 				if sm == AuthNone {
-					return AuthNone // 找到共同支持的无认证
+					return AuthNone
 				}
 			}
 		}
 	}
 
-	// 没有共同支持的认证方法
 	return AuthNoAccept
 }
 
-// SetUserQuota 设置用户流量配额（仅支持自定义时间段）
-// period: "custom"(自定义时间段), ""(无限制)
-// quotaBytes: 周期流量配额（字节），0 表示无限制
 func (a *PasswordAuth) SetUserQuota(username, period string, quotaBytes int64) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -737,19 +551,16 @@ func (a *PasswordAuth) SetUserQuota(username, period string, quotaBytes int64) b
 	user.QuotaPeriod = period
 	user.QuotaBytes = quotaBytes
 
-	// 设置自定义时间段配额
 	if period == "custom" && quotaBytes > 0 {
-		// 只有在时间段已设置的情况下才重置流量
 		if user.QuotaStartTime > 0 && user.QuotaEndTime > 0 {
 			user.QuotaResetTime = user.QuotaEndTime
-			atomic.StoreInt64(&user.QuotaUsed, 0) // 使用原子操作，设置配额时重置已用流量
+			atomic.StoreInt64(&user.QuotaUsed, 0)
 			log.Printf("用户 [%s] 配额已设置：%d MB，时间段：%s - %s",
 				username,
 				quotaBytes/1024/1024,
 				time.Unix(user.QuotaStartTime, 0).Format("2006-01-02 15:04:05"),
 				time.Unix(user.QuotaEndTime, 0).Format("2006-01-02 15:04:05"))
 		} else {
-			// 时间段未设置，先不重置流量，等待前端设置时间段
 			log.Printf("用户 [%s] 配额已设置：%d MB，等待设置时间段", username, quotaBytes/1024/1024)
 		}
 	}
@@ -757,18 +568,13 @@ func (a *PasswordAuth) SetUserQuota(username, period string, quotaBytes int64) b
 	return true
 }
 
-// calculateNextResetTime 计算下次重置时间
-// 参数 period: 流量周期（"daily"每日、"weekly"每周、"monthly"每月）
-// 返回：下次重置时间的 Unix 时间戳
 func (a *PasswordAuth) calculateNextResetTime(period string) int64 {
 	now := time.Now()
 	switch period {
 	case "daily":
-		// 明天零点
 		next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
 		return next.Unix()
 	case "weekly":
-		// 下周一零点
 		daysUntilMonday := int(time.Monday - now.Weekday())
 		if daysUntilMonday <= 0 {
 			daysUntilMonday += 7
@@ -776,7 +582,6 @@ func (a *PasswordAuth) calculateNextResetTime(period string) int64 {
 		next := time.Date(now.Year(), now.Month(), now.Day()+daysUntilMonday, 0, 0, 0, 0, now.Location())
 		return next.Unix()
 	case "monthly":
-		// 下月 1 号零点
 		var next time.Time
 		if now.Month() == time.December {
 			next = time.Date(now.Year()+1, time.January, 1, 0, 0, 0, 0, now.Location())
@@ -789,7 +594,6 @@ func (a *PasswordAuth) calculateNextResetTime(period string) int64 {
 	}
 }
 
-// SetUserQuotaTimeRange 安全地设置用户配额时间段（使用原子操作）
 func (a *PasswordAuth) SetUserQuotaTimeRange(username string, startTime, endTime int64) bool {
 	a.mu.RLock()
 	user, exists := a.users[username]
@@ -799,22 +603,14 @@ func (a *PasswordAuth) SetUserQuotaTimeRange(username string, startTime, endTime
 		return false
 	}
 
-	// 检查是否是首次设置时间段
 	isFirstTime := user.QuotaStartTime == 0 || user.QuotaEndTime == 0
 
-	// 使用原子操作设置时间段
 	atomic.StoreInt64(&user.QuotaStartTime, startTime)
 	atomic.StoreInt64(&user.QuotaEndTime, endTime)
 	atomic.StoreInt64(&user.QuotaResetTime, endTime)
 
-	// 如果是首次设置，重置已用流量
 	if isFirstTime {
 		atomic.StoreInt64(&user.QuotaUsed, 0)
-		log.Printf("[配额] 用户 [%s] 首次设置时间段，重置已用流量", username)
-	} else {
-		used := atomic.LoadInt64(&user.QuotaUsed)
-		log.Printf("[配额] 用户 [%s] 更新时间段，保留已用流量：%.2f MB",
-			username, float64(used)/1024/1024)
 	}
 
 	log.Printf("用户 [%s] 自定义时间段配额已设置：%s - %s",
@@ -825,7 +621,6 @@ func (a *PasswordAuth) SetUserQuotaTimeRange(username string, startTime, endTime
 	return true
 }
 
-// ClearUserQuota 安全地清除用户配额（使用原子操作）
 func (a *PasswordAuth) ClearUserQuota(username string) bool {
 	a.mu.RLock()
 	user, exists := a.users[username]
@@ -835,21 +630,18 @@ func (a *PasswordAuth) ClearUserQuota(username string) bool {
 		return false
 	}
 
-	// 使用原子操作清除配额
 	atomic.StoreInt64(&user.QuotaStartTime, 0)
 	atomic.StoreInt64(&user.QuotaEndTime, 0)
 	atomic.StoreInt64(&user.QuotaResetTime, 0)
 	atomic.StoreInt64(&user.QuotaUsed, 0)
 
-	// 非原子操作（在锁保护外，但只读一次）
 	user.QuotaPeriod = ""
 	user.QuotaBytes = 0
 
-	log.Printf("[配额] 用户 [%s] 已设置为无限制", username)
+	log.Printf("用户 [%s] 已设置为无限制", username)
 	return true
 }
 
-// CheckQuotaAndReset 检查并重置到期的流量配额（仅支持自定义时间段）
 func (a *PasswordAuth) CheckQuotaAndReset(username string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -859,11 +651,9 @@ func (a *PasswordAuth) CheckQuotaAndReset(username string) {
 		return
 	}
 
-	// 只处理自定义时间段配额
 	if user.QuotaPeriod == "custom" && user.QuotaBytes > 0 {
 		now := time.Now().Unix()
 
-		// 如果时间段已结束，重置流量（但用户已被禁止访问）
 		if now > user.QuotaEndTime {
 			quotaUsed := atomic.LoadInt64(&user.QuotaUsed)
 			if quotaUsed > 0 {
@@ -877,9 +667,7 @@ func (a *PasswordAuth) CheckQuotaAndReset(username string) {
 	}
 }
 
-// AddUserTraffic 增加用户流量使用量（极致优化版：减少锁竞争 + 支持持久化）
 func (a *PasswordAuth) AddUserTraffic(username string, upload, download int64) {
-	// 快速获取用户指针（只读操作使用读锁）
 	a.mu.RLock()
 	user, exists := a.users[username]
 	a.mu.RUnlock()
@@ -888,26 +676,16 @@ func (a *PasswordAuth) AddUserTraffic(username string, upload, download int64) {
 		return
 	}
 
-	// 使用原子操作更新流量统计（确保线程安全）
 	atomic.AddInt64(&user.UploadTotal, upload)
 	atomic.AddInt64(&user.DownloadTotal, download)
 
-	// 配额更新（仅在启用了配额时）
 	if user.QuotaPeriod != "" && user.QuotaBytes > 0 {
 		atomic.AddInt64(&user.QuotaUsed, upload+download)
-		// 调试日志：每 10MB 记录一次
-		used := atomic.LoadInt64(&user.QuotaUsed)
-		if used%(10*1024*1024) == 0 && used > 0 {
-			log.Printf("[配额统计] 用户 [%s] 已用配额：%.2f MB / %.2f MB",
-				username, float64(used)/1024/1024, float64(user.QuotaBytes)/1024/1024)
-		}
 	}
 
-	// 更新最后活动时间
 	atomic.StoreInt64(&user.LastActivity, time.Now().Unix())
 }
 
-// CheckQuotaExceeded 检查用户是否超出流量配额（仅支持自定义时间段）
 func (a *PasswordAuth) CheckQuotaExceeded(username string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -917,36 +695,29 @@ func (a *PasswordAuth) CheckQuotaExceeded(username string) bool {
 		return false
 	}
 
-	// 如果没有设置配额类型，不限制
 	if user.QuotaPeriod == "" {
 		return false
 	}
 
-	// 检查自定义时间段配额
 	if user.QuotaPeriod == "custom" {
 		now := time.Now().Unix()
 
-		// 使用原子操作读取字段，避免竞态条件
 		quotaStartTime := atomic.LoadInt64(&user.QuotaStartTime)
 		quotaEndTime := atomic.LoadInt64(&user.QuotaEndTime)
 		quotaUsed := atomic.LoadInt64(&user.QuotaUsed)
 
-		// ✅ 检查是否在自定义时间段内（即使 QuotaBytes == 0 也要检查时间）
 		if now < quotaStartTime {
-			// 时间段未开始，禁止访问
 			log.Printf("用户 [%s] 配额时间段未开始 (%s)，禁止连接",
 				username, time.Unix(quotaStartTime, 0).Format("2006-01-02 15:04:05"))
 			return true
 		}
 
 		if now > quotaEndTime {
-			// 时间段已结束，禁止访问
 			log.Printf("用户 [%s] 配额时间段已结束 (%s)，禁止连接",
 				username, time.Unix(quotaEndTime, 0).Format("2006-01-02 15:04:05"))
 			return true
 		}
 
-		// 时间段内，检查是否超出流量配额（QuotaBytes > 0 时才检查流量）
 		if user.QuotaBytes > 0 && quotaUsed >= user.QuotaBytes {
 			log.Printf("用户 [%s] 流量配额已用尽 (%.2f MB / %.2f MB)，禁止连接",
 				username, float64(quotaUsed)/1024/1024, float64(user.QuotaBytes)/1024/1024)
@@ -956,8 +727,6 @@ func (a *PasswordAuth) CheckQuotaExceeded(username string) bool {
 		return false
 	}
 
-	// 检查周期性配额（daily/weekly/monthly）
-	// 如果配额已用尽，禁止访问
 	quotaUsed := atomic.LoadInt64(&user.QuotaUsed)
 	if user.QuotaBytes > 0 && quotaUsed >= user.QuotaBytes {
 		log.Printf("用户 [%s] 流量配额已用尽 (%.2f MB / %.2f MB)，禁止连接",
@@ -968,9 +737,6 @@ func (a *PasswordAuth) CheckQuotaExceeded(username string) bool {
 	return false
 }
 
-// GetUserQuotaInfo 获取用户流量配额信息
-// 参数 username: 用户名
-// 返回：period(流量周期), total(总配额), used(已用配额), resetTime(重置时间), exists(用户是否存在)
 func (a *PasswordAuth) GetUserQuotaInfo(username string) (period string, total int64, used int64, resetTime int64, exists bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -983,7 +749,6 @@ func (a *PasswordAuth) GetUserQuotaInfo(username string) (period string, total i
 	return user.QuotaPeriod, user.QuotaBytes, atomic.LoadInt64(&user.QuotaUsed), user.QuotaResetTime, true
 }
 
-// GetUserQuotaUsed 获取用户已用流量配额
 func (a *PasswordAuth) GetUserQuotaUsed(username string) int64 {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -995,7 +760,6 @@ func (a *PasswordAuth) GetUserQuotaUsed(username string) int64 {
 	return atomic.LoadInt64(&user.QuotaUsed)
 }
 
-// GetUserQuotaTotal 获取用户总流量配额
 func (a *PasswordAuth) GetUserQuotaTotal(username string) int64 {
 	a.mu.RLock()
 	defer a.mu.RUnlock()

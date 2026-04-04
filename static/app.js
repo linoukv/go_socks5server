@@ -789,8 +789,8 @@ function validateConfigInput(config) {
     if (config.max_workers < 0 || config.max_workers > 10000) {
         errors.push('❌ 最大工作协程数必须在 0-10000 之间');
     }
-    if (config.max_conn_per_ip < 0 || config.max_conn_per_ip > 1000000) {
-        errors.push('❌ 单 IP 最大连接数必须在 0-1000000 之间');
+    if (config.max_conn_per_ip < 0 || config.max_conn_per_ip > 65535) {
+        errors.push('❌ 单 IP 最大连接数必须在 0-65535 之间');
     }
     if (config.read_speed_limit < 0 || config.read_speed_limit > 10737418240) {
         errors.push('❌ 上传速度限制过大');
@@ -872,5 +872,3 @@ async function saveConfig() {
         setButtonDisabled('#configModal button[type="button"], #configModal .btn-primary', false);
     }
 }
-
-
