@@ -60,15 +60,11 @@ func intToBool(i int) bool {
 	return i != 0
 }
 
-// initTables 初始化数据库表结构。
-// 创建 users、traffic_logs、connection_logs、system_config、admin_users 五个核心表，
-// 以及相关的索引以优化查询性能。
 func (m *DatabaseManager) initTables() error {
 	log.Println("开始初始化/更新数据库表结构...")
 
 	// 定义核心表结构
 	schemas := []string{
-		// users 表：存储 SOCKS5 用户信息
 		`CREATE TABLE IF NOT EXISTS users (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			username TEXT UNIQUE NOT NULL,
@@ -90,16 +86,6 @@ func (m *DatabaseManager) initTables() error {
 			quota_end_time INTEGER DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)`,
-
-		// traffic_logs 表：记录用户流量日志
-		`CREATE TABLE IF NOT EXISTS traffic_logs (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			username TEXT NOT NULL,
-			upload INTEGER DEFAULT 0,
-			download INTEGER DEFAULT 0,
-			log_time INTEGER NOT NULL,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
 
 		// connection_logs 表：记录用户连接/断开事件
@@ -139,8 +125,7 @@ func (m *DatabaseManager) initTables() error {
 
 	// 定义索引以优化查询性能
 	indexes := []string{
-		`CREATE INDEX IF NOT EXISTS idx_traffic_username ON traffic_logs(username)`,
-		`CREATE INDEX IF NOT EXISTS idx_traffic_time ON traffic_logs(log_time)`,
+
 		`CREATE INDEX IF NOT EXISTS idx_connection_username ON connection_logs(username)`,
 	}
 
@@ -280,6 +265,23 @@ func (m *DatabaseManager) DeleteAdminUser(username string) error {
 	defer m.mu.Unlock()
 
 	_, err := m.db.Exec("DELETE FROM admin_users WHERE username = ?", username)
+	return err
+}
+
+// UpdateUserQuotaUsed 仅更新用户的配额使用量和总流量（轻量级操作）。
+// 用于定期将内存中的流量统计数据持久化到数据库，避免频繁全量保存。
+//
+// 参数:
+//   - username: 用户名
+//   - quotaUsed: 已使用的配额字节数
+//   - uploadTotal: 累计上传流量
+//   - downloadTotal: 累计下载流量
+func (m *DatabaseManager) UpdateUserQuotaUsed(username string, quotaUsed, uploadTotal, downloadTotal int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	query := `UPDATE users SET quota_used = ?, upload_total = ?, download_total = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`
+	_, err := m.db.Exec(query, quotaUsed, uploadTotal, downloadTotal, username)
 	return err
 }
 
@@ -493,27 +495,10 @@ func (m *DatabaseManager) LoadAllUsersToAuth(auth *PasswordAuth) error {
 	return nil
 }
 
-// LogTraffic 记录用户流量日志到数据库。
-// 用于后续统计和分析用户的流量使用情况。
-//
-// 参数:
-//   - username: 用户名
-//   - upload: 上传字节数
-//   - download: 下载字节数
 func (m *DatabaseManager) LogTraffic(username string, upload, download int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	query := `
-		INSERT INTO traffic_logs (username, upload, download, log_time)
-		VALUES (?, ?, ?, ?)
-	`
-
-	_, err := m.db.Exec(query, username, upload, download, time.Now().Unix())
-	return err
+	return nil
 }
 
-// LogTotalTraffic 记录总流量日志（当前未使用，保留接口）。
 func (m *DatabaseManager) LogTotalTraffic(upload, download int64) error {
 	if upload == 0 && download == 0 {
 		return nil
@@ -531,126 +516,20 @@ func (m *DatabaseManager) LogTotalTraffic(upload, download int64) error {
 	return err
 }
 
-// CleanOldTrafficLogs 清理指定天数之前的旧流量日志。
-// 用于控制数据库大小，定期删除过期数据。
-//
-// 参数:
-//   - retentionDays: 保留天数，超过此天数的日志将被删除
 func (m *DatabaseManager) CleanOldTrafficLogs(retentionDays int) error {
-	if m == nil || m.db == nil {
-		log.Printf("警告：数据库未初始化，跳过流量日志清理")
-		return nil
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if retentionDays <= 0 {
-		return fmt.Errorf("保留天数必须大于 0")
-	}
-
-	cutoffTime := time.Now().AddDate(0, 0, -retentionDays).Unix()
-
-	query := `
-		DELETE FROM traffic_logs
-		WHERE log_time < ?
-	`
-
-	result, err := m.db.Exec(query, cutoffTime)
-	if err != nil {
-		return fmt.Errorf("清理流量日志失败：%w", err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		log.Printf("获取删除行数失败：%v", err)
-	} else {
-		log.Printf("清理流量日志：删除了 %d 条 %d 天前的记录", rowsAffected, retentionDays)
-	}
-
 	return nil
 }
 
-// GetTrafficLogsCount 获取当前流量日志的总数。
 func (m *DatabaseManager) GetTrafficLogsCount() (int64, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	query := `SELECT COUNT(*) FROM traffic_logs`
-	var count int64
-	err := m.db.QueryRow(query).Scan(&count)
-	return count, err
+	return 0, nil
 }
 
-// GetTrafficStats 获取指定时间段内用户的流量统计。
-//
-// 参数:
-//   - username: 用户名
-//   - startTime: 开始时间（Unix 时间戳）
-//   - endTime: 结束时间（Unix 时间戳）
-//
-// 返回:
-//   - totalUpload: 总上传字节数
-//   - totalDownload: 总下载字节数
-//   - err: 查询错误
 func (m *DatabaseManager) GetTrafficStats(username string, startTime, endTime int64) (totalUpload, totalDownload int64, err error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	query := `
-		SELECT COALESCE(SUM(upload), 0), COALESCE(SUM(download), 0)
-		FROM traffic_logs
-		WHERE username = ? AND log_time BETWEEN ? AND ?
-	`
-
-	err = m.db.QueryRow(query, username, startTime, endTime).Scan(&totalUpload, &totalDownload)
-	return
+	return 0, 0, nil
 }
 
-// GetUserTrafficReport 获取用户最近 N 天的每日流量报告。
-//
-// 参数:
-//   - username: 用户名
-//   - days: 天数
-//
-// 返回:
-//   - []map[string]interface{}: 每日流量数据列表
-//   - error: 查询错误
 func (m *DatabaseManager) GetUserTrafficReport(username string, days int) ([]map[string]interface{}, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	query := `
-		SELECT DATE(datetime(log_time, 'unixepoch')) as date,
-			   SUM(upload) as upload,
-			   SUM(download) as download
-		FROM traffic_logs
-		WHERE username = ? AND log_time >= strftime('%s', datetime('now', '-' || ? || ' days'))
-		GROUP BY DATE(datetime(log_time, 'unixepoch'))
-		ORDER BY date DESC
-	`
-
-	rows, err := m.db.Query(query, username, days)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var reports []map[string]interface{}
-	for rows.Next() {
-		var date string
-		var upload, download int64
-		if err := rows.Scan(&date, &upload, &download); err != nil {
-			return nil, err
-		}
-		reports = append(reports, map[string]interface{}{
-			"date":     date,
-			"upload":   upload,
-			"download": download,
-		})
-	}
-
-	return reports, rows.Err()
+	return []map[string]interface{}{}, nil
 }
 
 // LogConnection 记录用户连接/断开事件。

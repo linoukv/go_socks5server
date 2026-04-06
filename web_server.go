@@ -32,7 +32,7 @@ type RateLimiter struct {
 	mu       sync.Mutex               // 保护 visitors map，确保并发安全
 	visitors map[string]*rate.Limiter // IP -> 限流器映射，每个 IP 独立的限流器
 	rate     rate.Limit               // 每秒允许的请求数（令牌生成速率）
-	burst    int                      // 允许的最大突发请求数（令牌桶容量）
+	burst    int                      // 允许的最大突发请求数（令牌桶容量） 
 }
 
 // AdminUser Web 管理员用户结构体。

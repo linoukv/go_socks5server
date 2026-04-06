@@ -76,51 +76,6 @@ func main() {
 	log.Printf("Web 管理界面已启动在 http://%s", webAddr)
 	log.Printf("服务器配置：%+v", summarizeConfig(config))
 
-	// 启动流量日志定时清理任务（每天凌晨 2 点清理 1 天前的数据）
-	go func() {
-		time.Sleep(10 * time.Second) // 等待 10 秒让系统稳定
-
-		if db == nil {
-			log.Println("数据库未初始化，跳过流量日志清理任务")
-			return
-		}
-
-		log.Println("启动流量日志清理...")
-		if err := db.CleanOldTrafficLogs(1); err != nil {
-			log.Printf("流量日志清理失败：%v", err)
-		} else {
-			if count, err := db.GetTrafficLogsCount(); err == nil {
-				log.Printf("当前流量日志总数：%d 条", count)
-			}
-		}
-
-		// 循环执行定时清理
-		for {
-			now := time.Now()
-			// 计算下一个凌晨 2 点的时间
-			next := time.Date(now.Year(), now.Month(), now.Day(), 2, 0, 0, 0, now.Location())
-
-			if now.After(next) {
-				next = next.Add(24 * time.Hour) // 如果已过 2 点，则设为明天
-			}
-
-			duration := next.Sub(now)
-			log.Printf("下次流量日志清理时间：%s (等待 %v)", next.Format("2006-01-02 15:04:05"), duration.Round(time.Second))
-
-			time.Sleep(duration)
-
-			log.Println("执行定时流量日志清理...")
-			if err := db.CleanOldTrafficLogs(1); err != nil {
-				log.Printf("流量日志清理失败：%v", err)
-			} else {
-				if count, err := db.GetTrafficLogsCount(); err == nil {
-					log.Printf("当前流量日志总数：%d 条", count)
-				}
-			}
-		}
-	}()
-	log.Println("流量日志定时清理任务已启动（每天凌晨 2 点清理 30 天前的数据）")
-
 	// 设置信号处理，支持优雅关闭
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

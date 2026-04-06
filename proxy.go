@@ -182,8 +182,7 @@ func (p *TCPProxy) copyWithStats(dst, src net.Conn, upload bool) {
 	const batchThreshold int64 = 256 * 1024
 	const flushThreshold int64 = 32 * 1024
 	const flushTimeout = 100 * time.Millisecond
-	const dbFlushInterval = 5 * time.Second
-	const dbBatchThreshold = 100 * 1024
+	const dbFlushInterval = 10 * time.Second
 	localUpload := int64(0)
 	localDownload := int64(0)
 	dbUpload := int64(0)
@@ -238,17 +237,6 @@ func (p *TCPProxy) copyWithStats(dst, src net.Conn, upload bool) {
 					auth.AddUserTraffic(username, 0, int64(n))
 				}
 
-				if dbManager != nil {
-					now := time.Now()
-					if (p.pendingUpload >= dbBatchThreshold || p.pendingDownload >= dbBatchThreshold ||
-						now.Sub(lastDbFlush) > dbFlushInterval) && (p.pendingUpload > 0 || p.pendingDownload > 0) {
-						dbManager.LogTraffic(username, p.pendingUpload, p.pendingDownload)
-						p.pendingUpload = 0
-						p.pendingDownload = 0
-						lastDbFlush = now
-					}
-				}
-
 				quotaCheckCounter++
 				now := time.Now()
 				if quotaCheckCounter >= 100 || now.Sub(lastQuotaCheck) > 100*time.Millisecond {
@@ -261,6 +249,20 @@ func (p *TCPProxy) copyWithStats(dst, src net.Conn, upload bool) {
 							float64(auth.GetUserQuotaTotal(username))/1024/1024)
 						return
 					}
+				}
+				// 定期将内存中的流量数据持久化到数据库
+				if now.Sub(lastDbFlush) > dbFlushInterval {
+					if user, exists := auth.GetUser(username); exists {
+						if err := dbManager.UpdateUserQuotaUsed(
+							username,
+							atomic.LoadInt64(&user.QuotaUsed),
+							atomic.LoadInt64(&user.UploadTotal),
+							atomic.LoadInt64(&user.DownloadTotal),
+						); err != nil {
+							log.Printf("保存用户 [%s] 流量数据失败: %v", username, err)
+						}
+					}
+					lastDbFlush = now
 				}
 			}
 
@@ -377,11 +379,15 @@ func (p *TCPProxy) Close() {
 				clientIP := p.clientConn.RemoteAddr().String()
 				p.authCache.RemoveUserIP(p.username, clientIP)
 			}
-			if dbManager != nil {
-				pendingUpload := atomic.LoadInt64(&p.pendingUpload)
-				pendingDownload := atomic.LoadInt64(&p.pendingDownload)
-				if pendingUpload > 0 || pendingDownload > 0 {
-					dbManager.LogTraffic(p.username, pendingUpload, pendingDownload)
+			// 连接关闭时保存最终的流量数据
+			if user, exists := p.authCache.GetUser(p.username); exists {
+				if err := dbManager.UpdateUserQuotaUsed(
+					p.username,
+					atomic.LoadInt64(&user.QuotaUsed),
+					atomic.LoadInt64(&user.UploadTotal),
+					atomic.LoadInt64(&user.DownloadTotal),
+				); err != nil {
+					log.Printf("保存用户 [%s] 最终流量数据失败: %v", p.username, err)
 				}
 			}
 		}
@@ -577,8 +583,16 @@ func (u *UDPAssociation) forwardToRemoteWithPool(header *UDPHeader, clientKey st
 		return
 	}
 
+	uploadSize := int64(len(header.Data))
 	if u.server != nil && u.server.stats != nil {
-		u.server.stats.AddUpload(int64(len(header.Data)))
+		u.server.stats.AddUpload(uploadSize)
+	}
+
+	// 用户流量统计
+	if u.username != "" && u.server != nil && u.server.config != nil {
+		if auth, ok := u.server.config.Auth.(*PasswordAuth); ok {
+			auth.AddUserTraffic(u.username, uploadSize, 0)
+		}
 	}
 
 	responseBuf := udpBufferPool.Get().([]byte)
@@ -610,8 +624,16 @@ func (u *UDPAssociation) forwardToRemoteWithPool(header *UDPHeader, clientKey st
 
 		u.udpListener.WriteToUDP(respData, clientAddr)
 
+		downloadSize := int64(n)
 		if u.server != nil && u.server.stats != nil {
-			u.server.stats.AddDownload(int64(n))
+			u.server.stats.AddDownload(downloadSize)
+		}
+
+		// 用户流量统计
+		if u.username != "" && u.server != nil && u.server.config != nil {
+			if auth, ok := u.server.config.Auth.(*PasswordAuth); ok {
+				auth.AddUserTraffic(u.username, 0, downloadSize)
+			}
 		}
 	}
 }
@@ -670,6 +692,17 @@ func (u *UDPAssociation) Close() {
 		if u.username != "" && u.server != nil && u.server.config != nil && u.server.config.EnableUserManagement {
 			if auth, ok := u.server.config.Auth.(*PasswordAuth); ok {
 				auth.DecrementUserConnection(u.username)
+				// 连接关闭时保存最终的流量数据
+				if user, exists := auth.GetUser(u.username); exists {
+					if err := dbManager.UpdateUserQuotaUsed(
+						u.username,
+						atomic.LoadInt64(&user.QuotaUsed),
+						atomic.LoadInt64(&user.UploadTotal),
+						atomic.LoadInt64(&user.DownloadTotal),
+					); err != nil {
+						log.Printf("保存用户 [%s] UDP最终流量数据失败: %v", u.username, err)
+					}
+				}
 			}
 		}
 	})
