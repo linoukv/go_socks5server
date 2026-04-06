@@ -1,3 +1,6 @@
+// Package main 实现 SOCKS5 代理服务器的 Web 管理界面模块。
+// 提供基于 HTTP 的用户管理、流量统计、配额设置、系统配置等功能，
+// 包含会话管理、CSRF 防护、验证码、速率限制等安全机制。
 package main
 
 import (
@@ -23,36 +26,50 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// RateLimiter 基于 IP 的速率限制器，防止 API 滥用。
+// 使用 golang.org/x/time/rate 包实现令牌桶算法。
 type RateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*rate.Limiter
-	rate     rate.Limit
-	burst    int
+	mu       sync.Mutex               // 保护 visitors map，确保并发安全
+	visitors map[string]*rate.Limiter // IP -> 限流器映射，每个 IP 独立的限流器
+	rate     rate.Limit               // 每秒允许的请求数（令牌生成速率）
+	burst    int                      // 允许的最大突发请求数（令牌桶容量）
 }
 
+// AdminUser Web 管理员用户结构体。
+// 包含登录状态、失败计数、账户锁定等安全管理字段。
 type AdminUser struct {
-	Username            string `json:"username"`
-	PasswordHash        string `json:"-"`
-	Enabled             bool   `json:"enabled"`
-	LastLogin           int64  `json:"last_login"`
-	LoginCount          int    `json:"login_count"`
-	CreateTime          int64  `json:"create_time"`
-	LastPasswordChange  int64  `json:"last_password_change"`
-	ForcePasswordChange bool   `json:"force_password_change"`
-	LoginFailCount      int    `json:"-"`
-	LastLoginFailTime   int64  `json:"-"`
-	LockUntil           int64  `json:"-"`
+	Username            string `json:"username"`              // 管理员用户名
+	PasswordHash        string `json:"-"`                     // bcrypt 加密的密码哈希（不暴露给前端）
+	Enabled             bool   `json:"enabled"`               // 是否启用账户
+	LastLogin           int64  `json:"last_login"`            // 最后登录时间（Unix 时间戳）
+	LoginCount          int    `json:"login_count"`           // 累计登录次数
+	CreateTime          int64  `json:"create_time"`           // 账户创建时间
+	LastPasswordChange  int64  `json:"last_password_change"`  // 最后密码修改时间
+	ForcePasswordChange bool   `json:"force_password_change"` // 是否强制修改密码（首次登录）
+	LoginFailCount      int    `json:"-"`                     // 登录失败次数（内部使用，达到阈值后锁定账户）
+	LastLoginFailTime   int64  `json:"-"`                     // 最后登录失败时间（内部使用，用于重置计数器）
+	LockUntil           int64  `json:"-"`                     // 账户锁定截止时间（内部使用，Unix 时间戳）
 }
 
+// Session 管理员会话结构体。
+// 用于跟踪已登录的管理员状态，支持空闲超时和绝对过期机制。
 type Session struct {
-	Token        string `json:"token"`
-	Username     string `json:"username"`
-	ExpireTime   int64  `json:"expire_time"`
-	ClientIP     string `json:"client_ip"`
-	CreateTime   int64  `json:"create_time"`
-	LastActivity int64  `json:"last_activity"`
+	Token        string `json:"token"`         // 会话令牌（随机生成的 64 字符十六进制字符串）
+	Username     string `json:"username"`      // 管理员用户名
+	ExpireTime   int64  `json:"expire_time"`   // 会话绝对过期时间（24小时，从创建时计算）
+	ClientIP     string `json:"client_ip"`     // 客户端 IP 地址（用于审计和安全检查）
+	CreateTime   int64  `json:"create_time"`   // 会话创建时间（Unix 时间戳）
+	LastActivity int64  `json:"last_activity"` // 最后活动时间（用于空闲超时检测，30分钟无活动则失效）
 }
 
+// NewRateLimiter 创建一个新的速率限制器。
+//
+// 参数:
+//   - requestsPerSecond: 每秒允许的请求数
+//   - burst: 允许的最大突发请求数
+//
+// 返回:
+//   - *RateLimiter: 初始化后的限流器实例
 func NewRateLimiter(requestsPerSecond float64, burst int) *RateLimiter {
 	return &RateLimiter{
 		visitors: make(map[string]*rate.Limiter),
@@ -61,12 +78,16 @@ func NewRateLimiter(requestsPerSecond float64, burst int) *RateLimiter {
 	}
 }
 
+// getLimiter 获取或创建指定 IP 的限流器。
+// 使用互斥锁保证并发安全，每个 IP 有独立的限流器实例。
+// 如果该 IP 首次访问，会创建一个新的令牌桶限流器。
 func (rl *RateLimiter) getLimiter(ip string) *rate.Limiter {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
 	limiter, exists := rl.visitors[ip]
 	if !exists {
+		// 创建新的限流器：指定速率和突发容量
 		limiter = rate.NewLimiter(rl.rate, rl.burst)
 		rl.visitors[ip] = limiter
 	}
@@ -74,46 +95,67 @@ func (rl *RateLimiter) getLimiter(ip string) *rate.Limiter {
 	return limiter
 }
 
+// Allow 检查指定 IP 是否允许发起请求。
+// 基于令牌桶算法，如果桶中有可用令牌则允许请求并消耗一个令牌。
+// 返回 true 表示允许请求，false 表示请求被限流。
 func (rl *RateLimiter) Allow(ip string) bool {
 	return rl.getLimiter(ip).Allow()
 }
 
+// Middleware HTTP 中间件，自动应用速率限制。
+// 拦截所有通过此中间件的请求，检查客户端 IP 的请求频率。
+// 如果超过限制，返回 HTTP 429 (Too Many Requests) 错误。
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := r.RemoteAddr
+		ip := r.RemoteAddr // 获取客户端 IP 地址
 
 		if !rl.Allow(ip) {
 			log.Printf("限流触发：IP=%s", ip)
-			http.Error(w, "请求过于频繁，请稍后再试", http.StatusTooManyRequests)
+			http.Error(w, "请求过于频繁，请稍后再试", http.StatusTooManyRequests) // 429 状态码
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r) // 请求未超限，继续处理下一个处理器
 	})
 }
 
+// WebServer Web 管理服务器结构体。
+// 管理 HTTP 服务、会话、管理员用户、验证码等组件，是 Web 管理界面的核心。
 type WebServer struct {
-	auth         *PasswordAuth
-	db           *DatabaseManager
-	socksServer  *Server
-	server       *http.Server
-	adminUsers   map[string]*AdminUser
-	adminMu      sync.RWMutex
-	sessions     map[string]*Session
-	sessionMu    sync.RWMutex
-	captchaStore map[string]*CaptchaInfo
-	captchaMu    sync.RWMutex
-	submitTokens map[string]int64
-	submitMu     sync.RWMutex
-	csrfSecret   []byte
+	auth         *PasswordAuth           // SOCKS5 认证器，管理代理用户的认证和限速
+	db           *DatabaseManager        // 数据库管理器，负责用户数据和配置的持久化
+	socksServer  *Server                 // SOCKS5 服务器实例，用于获取服务器统计信息
+	server       *http.Server            // HTTP 服务器，处理 Web 请求
+	adminUsers   map[string]*AdminUser   // 管理员用户映射（用户名 -> 用户信息）
+	adminMu      sync.RWMutex            // 管理员数据的读写锁，支持并发读、独占写
+	sessions     map[string]*Session     // 活跃会话映射（token -> 会话信息）
+	sessionMu    sync.RWMutex            // 会话数据的读写锁
+	captchaStore map[string]*CaptchaInfo // 验证码存储（captchaID -> 验证码信息），内存存储
+	captchaMu    sync.RWMutex            // 验证码数据的读写锁
+	submitTokens map[string]int64        // 提交令牌记录（防重复提交，token -> 时间戳）
+	submitMu     sync.RWMutex            // 提交令牌的读写锁
+	csrfSecret   []byte                  // CSRF 密钥，用于生成和验证 CSRF 令牌
 }
 
+// CaptchaInfo 验证码信息结构体。
+// 用于存储生成的验证码及其状态，支持失败次数限制和过期机制。
 type CaptchaInfo struct {
-	Code      string
-	ExpireAt  int64
-	FailCount int
+	Code      string // 验证码文本（4位字符，排除易混淆字符）
+	ExpireAt  int64  // 过期时间（Unix 时间戳，默认5分钟有效期）
+	FailCount int    // 验证失败次数（超过5次则自动销毁，防止暴力破解）
 }
 
+// NewWebServer 创建并初始化 Web 管理服务器。
+// 完成管理员账户初始化、路由注册、中间件配置等工作。
+//
+// 参数:
+//   - auth: SOCKS5 认证器，如果为 nil 则创建空实例
+//   - db: 数据库管理器，用于持久化用户和配置
+//   - socksServer: SOCKS5 服务器实例，用于获取统计数据
+//   - listenAddr: Web 服务监听地址（例如 ":8080"）
+//
+// 返回:
+//   - *WebServer: 初始化后的 Web 服务器实例
 func NewWebServer(auth *PasswordAuth, db *DatabaseManager, socksServer *Server, listenAddr string) *WebServer {
 	if auth == nil {
 		log.Printf("警告：auth 为 nil，创建空的 PasswordAuth")
@@ -135,8 +177,11 @@ func NewWebServer(auth *PasswordAuth, db *DatabaseManager, socksServer *Server, 
 		csrfSecret:   generateCSRFSecret(),
 	}
 
+	// 初始化默认管理员账户（admin / password123）
+	// 首次启动时创建，后续从数据库加载
 	ws.initDefaultAdmin()
 
+	// 从数据库加载已保存的管理员用户
 	if db != nil {
 		if err := db.LoadAdminUsers(ws); err != nil {
 			log.Printf("加载管理员用户失败：%v", err)
@@ -145,26 +190,34 @@ func NewWebServer(auth *PasswordAuth, db *DatabaseManager, socksServer *Server, 
 		}
 	}
 
+	// 注册 HTTP 路由
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/users", ws.handleUsers)
-	mux.HandleFunc("/api/stats", ws.handleStats)
-	mux.HandleFunc("/api/traffic", ws.handleTraffic)
-	mux.HandleFunc("/api/dashboard", ws.handleDashboard)
-	mux.HandleFunc("/api/user-quota", ws.handleUserQuota)
-	mux.HandleFunc("/api/quota/stats", ws.handleQuotaStats)
-	mux.HandleFunc("/api/admin/batch-set-quota", ws.handleBatchSetQuota)
-	mux.HandleFunc("/api/admin/login", ws.handleAdminLogin)
-	mux.HandleFunc("/api/admin/logout", ws.handleAdminLogout)
-	mux.HandleFunc("/api/admin/check", ws.handleAdminCheck)
-	mux.HandleFunc("/api/admin/captcha", ws.handleCaptcha)
-	mux.HandleFunc("/api/admin/change-password", ws.handleChangePassword)
+	// API 路由：用户管理
+	mux.HandleFunc("/api/users", ws.handleUsers)         // 用户 CRUD 操作
+	mux.HandleFunc("/api/stats", ws.handleStats)         // 统计信息
+	mux.HandleFunc("/api/traffic", ws.handleTraffic)     // 流量日志
+	mux.HandleFunc("/api/dashboard", ws.handleDashboard) // 仪表盘数据
+
+	// API 路由：配额管理
+	mux.HandleFunc("/api/user-quota", ws.handleUserQuota)                // 用户配额设置
+	mux.HandleFunc("/api/quota/stats", ws.handleQuotaStats)              // 配额统计
+	mux.HandleFunc("/api/admin/batch-set-quota", ws.handleBatchSetQuota) // 批量设置配额
+
+	// API 路由：管理员认证
+	mux.HandleFunc("/api/admin/login", ws.handleAdminLogin)               // 管理员登录
+	mux.HandleFunc("/api/admin/logout", ws.handleAdminLogout)             // 管理员登出
+	mux.HandleFunc("/api/admin/check", ws.handleAdminCheck)               // 检查登录状态
+	mux.HandleFunc("/api/admin/captcha", ws.handleCaptcha)                // 生成验证码
+	mux.HandleFunc("/api/admin/change-password", ws.handleChangePassword) // 修改密码
+
+	// API 路由：系统配置
 	mux.HandleFunc("/api/admin/auth-method", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case "GET":
-			ws.handleGetAuthMethod(w, r)
+			ws.handleGetAuthMethod(w, r) // 获取认证方式
 		case "POST":
-			ws.handleSetAuthMethod(w, r)
+			ws.handleSetAuthMethod(w, r) // 设置认证方式
 		default:
 			http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
 		}
@@ -172,14 +225,16 @@ func NewWebServer(auth *PasswordAuth, db *DatabaseManager, socksServer *Server, 
 	mux.HandleFunc("/api/admin/config", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case "GET":
-			ws.handleGetConfig(w, r)
+			ws.handleGetConfig(w, r) // 获取服务器配置
 		case "POST":
-			ws.handleSetConfig(w, r)
+			ws.handleSetConfig(w, r) // 设置服务器配置
 		default:
 			http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
 		}
 	})
 
+	// 静态文件服务
+	// 优先使用嵌入的静态文件系统，如果不存在则使用本地 static 目录
 	staticFS := getStaticFileSystem()
 	if staticFS != nil {
 		fs := http.FileServer(staticFS)
@@ -189,42 +244,56 @@ func NewWebServer(auth *PasswordAuth, db *DatabaseManager, socksServer *Server, 
 		mux.Handle("/static/", http.StripPrefix("/static/", fs))
 	}
 
-	mux.HandleFunc("/", ws.handleIndex)
+	// 页面路由
+	mux.HandleFunc("/", ws.handleIndex)           // 首页（管理界面）
+	mux.HandleFunc("/login.html", ws.handleLogin) // 登录页面
+	mux.HandleFunc("/quota.html", ws.handleQuota) // 配额管理页面
 
-	mux.HandleFunc("/login.html", ws.handleLogin)
-
-	mux.HandleFunc("/quota.html", ws.handleQuota)
-
+	// 创建速率限制器（每秒 10 请求，突发 20）
+	// 用于防止 API 滥用和 DDoS 攻击
 	rateLimiter := NewRateLimiter(10.0, 20)
 
+	// 创建 HTTP 服务器，应用中间件链
+	// 中间件执行顺序：安全头 -> CORS -> 认证 -> 速率限制
 	ws.server = &http.Server{
 		Addr:           listenAddr,
 		Handler:        rateLimiter.Middleware(ws.authMiddleware(ws.corsMiddleware(setSecurityHeaders(mux)))),
-		ReadTimeout:    10 * time.Second,
-		WriteTimeout:   10 * time.Second,
-		MaxHeaderBytes: 1 << 20,
+		ReadTimeout:    10 * time.Second, // 读取超时：防止慢速连接攻击
+		WriteTimeout:   10 * time.Second, // 写入超时：防止响应过慢
+		MaxHeaderBytes: 1 << 20,          // 最大请求头大小：1MB
 	}
 
 	return ws
 }
 
+// generateCaptcha 生成 4 位随机验证码图片和文本。
+// 使用排除易混淆字符的字符集（排除 0,O,1,I,l 等）。
+// 生成的验证码图片包含干扰线，增加 OCR 识别难度。
+//
+// 返回:
+//   - string: 验证码文本（4位大写字母和数字）
+//   - image.Image: 验证码图片（PNG 格式，120x50 像素）
 func (ws *WebServer) generateCaptcha() (string, image.Image) {
-	chars := "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+	chars := "23456789ABCDEFGHJKLMNPQRSTUVWXYZ" // 排除 0,O,1,I,l 等易混淆字符
 	code := ""
 	for i := 0; i < 4; i++ {
+		// 使用加密安全的随机数生成器
 		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
 		code += string(chars[n.Int64()])
 	}
 
-	width, height := 120, 50
+	width, height := 120, 50 // 图片尺寸：宽120px，高50px
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 
+	// 填充白色背景
 	for x := 0; x < width; x++ {
 		for y := 0; y < height; y++ {
 			img.Set(x, y, color.RGBA{255, 255, 255, 255})
 		}
 	}
 
+	// 绘制干扰线（5条随机颜色的直线）
+	// 干扰线用于增加自动化识别的难度
 	for i := 0; i < 5; i++ {
 		x1, _ := rand.Int(rand.Reader, big.NewInt(int64(width)))
 		y1, _ := rand.Int(rand.Reader, big.NewInt(int64(height)))
@@ -236,13 +305,14 @@ func (ws *WebServer) generateCaptcha() (string, image.Image) {
 		drawLine(img, x1.Int64(), y1.Int64(), x2.Int64(), y2.Int64(), color.RGBA{uint8(r.Int64()), uint8(g.Int64()), uint8(b.Int64()), 255})
 	}
 
+	// 绘制验证码字符（每个字符不同颜色）
 	for i, ch := range code {
 		r := uint8(50 + (i*40)%200)
 		g := uint8(50 + (i*60)%200)
 		b := uint8(100 + (i*30)%155)
 
-		x := (i * 25) + 15
-		y := 30
+		x := (i * 25) + 15 // 字符水平位置
+		y := 30            // 字符垂直位置
 
 		drawChar(img, ch, x, y, color.RGBA{r, g, b, 255})
 	}
@@ -250,35 +320,53 @@ func (ws *WebServer) generateCaptcha() (string, image.Image) {
 	return code, img
 }
 
+// drawLine 在图片上绘制一条直线（Bresenham 算法简化版）。
+// 使用线性插值方法，在两点之间绘制连续像素点。
+//
+// 参数:
+//   - img: 目标图片
+//   - x1, y1: 起点坐标
+//   - x2, y2: 终点坐标
+//   - c: 线条颜色
 func drawLine(img *image.RGBA, x1, y1, x2, y2 int64, c color.RGBA) {
 	dx := int(x2 - x1)
 	dy := int(y2 - y1)
-	steps := max(abs(dx), abs(dy))
+	steps := max(abs(dx), abs(dy)) // 步数取 dx 和 dy 的最大值
 	if steps == 0 {
 		steps = 1
 	}
-	xIncrement := float64(dx) / float64(steps)
-	yIncrement := float64(dy) / float64(steps)
+	xIncrement := float64(dx) / float64(steps) // X 方向每步增量
+	yIncrement := float64(dy) / float64(steps) // Y 方向每步增量
 
 	x := float64(x1)
 	y := float64(y1)
 	for i := 0; i <= steps; i++ {
-		img.Set(int(x), int(y), c)
+		img.Set(int(x), int(y), c) // 设置像素颜色
 		x += xIncrement
 		y += yIncrement
 	}
 }
 
+// drawChar 在图片上绘制一个字符（使用点阵字体）。
+// 每个字符由 7x5 的点阵图案表示，放大 2 倍绘制。
+//
+// 参数:
+//   - img: 目标图片
+//   - ch: 要绘制的字符
+//   - x, y: 字符左上角坐标
+//   - c: 字符颜色
 func drawChar(img *image.RGBA, ch rune, x, y int, c color.RGBA) {
 	charMap := map[rune][]string{
+		// 数字 2-9 的点阵图案（7行5列）
 		'2': {"01110", "10001", "00010", "00100", "01000", "10000", "11111"},
 		'3': {"01110", "10001", "00001", "00110", "00001", "10001", "01110"},
 		'4': {"00010", "00110", "01010", "10010", "11111", "00010", "00010"},
-		'5': {"11111", "10000", "11110", "00001", "00001", "10001", "01110"},
+		'5': {"11111", "10000", "10000", "11110", "10000", "10000", "11111"},
 		'6': {"00110", "01000", "10000", "11110", "10001", "10001", "01110"},
 		'7': {"11111", "00001", "00010", "00100", "01000", "01000", "01000"},
 		'8': {"01110", "10001", "10001", "01110", "10001", "10001", "01110"},
 		'9': {"01110", "10001", "10001", "01111", "00001", "00010", "01100"},
+		// 大写字母 A-Z 的点阵图案（排除易混淆的 I、O）
 		'A': {"00100", "01010", "10001", "10001", "11111", "10001", "10001"},
 		'B': {"11110", "10001", "10001", "11110", "10001", "10001", "11110"},
 		'C': {"01110", "10001", "10000", "10000", "10000", "10001", "01110"},
@@ -307,12 +395,15 @@ func drawChar(img *image.RGBA, ch rune, x, y int, c color.RGBA) {
 
 	patterns, exists := charMap[ch]
 	if !exists {
-		return
+		return // 如果字符不在点阵表中，直接返回
 	}
 
+	// 遍历点阵图案，将 '1' 的位置绘制为指定颜色
+	// 每个点放大 2x2 像素，使字符更清晰
 	for row, pattern := range patterns {
 		for col, pixel := range pattern {
 			if pixel == '1' {
+				// 绘制 2x2 像素块
 				img.Set(x+col*2, y+row*2, c)
 				img.Set(x+col*2+1, y+row*2, c)
 				img.Set(x+col*2, y+row*2+1, c)
@@ -322,6 +413,8 @@ func drawChar(img *image.RGBA, ch rune, x, y int, c color.RGBA) {
 	}
 }
 
+// max 返回两个整数中的较大值。
+// 用于计算直线绘制的步数。
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -329,6 +422,8 @@ func max(a, b int) int {
 	return b
 }
 
+// abs 返回整数的绝对值。
+// 用于计算直线绘制的距离。
 func abs(x int) int {
 	if x < 0 {
 		return -x
@@ -336,30 +431,45 @@ func abs(x int) int {
 	return x
 }
 
+// sanitizeUsername 脱敏用户名，用于日志输出。
+// 保留首尾字符，中间用 * 替代，保护用户隐私。
+// 例如："admin" -> "a**n", "ab" -> "***"
 func sanitizeUsername(username string) string {
 	if len(username) <= 2 {
-		return "***"
+		return "***" // 用户名太短，全部隐藏
 	}
 	return username[:1] + strings.Repeat("*", len(username)-2) + username[len(username)-1:]
 }
 
+// Start 启动 Web 服务器。
+// 开始监听指定地址，处理 HTTP 请求。
+// 如果端口被占用或权限不足，将返回错误。
 func (ws *WebServer) Start() error {
 	fmt.Printf("Web 管理界面已启动在 http://%s\n", ws.server.Addr)
 	return ws.server.ListenAndServe()
 }
 
+// Stop 停止 Web 服务器。
+// 关闭监听器，停止接受新连接，现有连接会被中断。
 func (ws *WebServer) Stop() error {
 	return ws.server.Close()
 }
 
+// corsMiddleware CORS 跨域中间件，允许前端跨域访问 API。
+// 设置 Access-Control-Allow-* 响应头，支持跨域请求。
+// 对于 OPTIONS 预检请求，直接返回 200 状态码。
 func (ws *WebServer) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
+		// 允许所有来源访问（生产环境应限制具体域名）
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// 允许的 HTTP 方法
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		// 允许的请求头
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token, X-Captcha-ID")
+		// 暴露的响应头（前端可以访问这些头）
 		w.Header().Set("Access-Control-Expose-Headers", "X-Captcha-ID, X-Auth-Token")
 
+		// 处理 OPTIONS 预检请求
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -369,7 +479,10 @@ func (ws *WebServer) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// handleIndex 处理首页请求。
+// 返回管理界面的 HTML 页面，嵌入在二进制文件中。
 func (ws *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
+	// 只处理根路径和 /index.html
 	if r.URL.Path != "/" && r.URL.Path != "/index.html" {
 		http.NotFound(w, r)
 		return
@@ -378,10 +491,13 @@ func (ws *WebServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	htmlData := getIndexHTML()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// 设置内容安全策略，限制资源加载来源
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'")
 	w.Write([]byte(htmlData))
 }
 
+// handleLogin 处理登录页面请求。
+// 返回管理员登录界面的 HTML 页面。
 func (ws *WebServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/login.html" {
 		http.NotFound(w, r)
@@ -395,6 +511,8 @@ func (ws *WebServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(htmlData))
 }
 
+// handleQuota 处理配额管理页面请求。
+// 返回用户配额管理界面的 HTML 页面。
 func (ws *WebServer) handleQuota(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/quota.html" {
 		http.NotFound(w, r)
@@ -408,6 +526,9 @@ func (ws *WebServer) handleQuota(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(htmlData))
 }
 
+// handleUsers 处理用户管理 API（GET/POST/PUT/DELETE）。
+// 提供 SOCKS5 代理用户的 CRUD 操作，包括创建、查询、更新、删除用户。
+// 所有操作都需要有效的管理员会话令牌。
 func (ws *WebServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 	if ws.auth == nil {
 		log.Printf("错误：auth 为 nil")
@@ -415,6 +536,7 @@ func (ws *WebServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 提取认证 Token（支持 Authorization 头和 X-Auth-Token 头）
 	authHeader := r.Header.Get("Authorization")
 	var token string
 
@@ -435,6 +557,7 @@ func (ws *WebServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 验证会话令牌的有效性
 	session, valid := ws.validateSession(token)
 	if !valid {
 		log.Printf("[安全] handleUsers 无效 token：%s %s", session.Username, r.RemoteAddr)
@@ -444,8 +567,10 @@ func (ws *WebServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
+		// 获取用户列表
 		users := ws.auth.ListUsers()
 		if len(users) == 0 {
+			// 如果内存中没有用户，尝试从数据库加载
 			if ws.db != nil {
 				if err := ws.db.LoadAllUsersToAuth(ws.auth); err != nil {
 					log.Printf("从数据库加载用户失败：%v", err)
@@ -459,18 +584,19 @@ func (ws *WebServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(users)
 
 	case "POST":
+		// 创建新用户
 		var data struct {
 			Username         string `json:"username"`
 			Password         string `json:"password"`
 			Group            string `json:"group"`
-			ReadLimit        int64  `json:"read_limit"`
-			WriteLimit       int64  `json:"write_limit"`
-			MaxConn          int    `json:"max_conn"`
-			MaxIPConnections int    `json:"max_ip_connections"`
-			QuotaPeriod      string `json:"quota_period"`
-			QuotaBytes       int64  `json:"quota_bytes"`
-			QuotaStartTime   int64  `json:"quota_start_time"`
-			QuotaEndTime     int64  `json:"quota_end_time"`
+			ReadLimit        int64  `json:"read_limit"`         // 上传速度限制（字节/秒）
+			WriteLimit       int64  `json:"write_limit"`        // 下载速度限制（字节/秒）
+			MaxConn          int    `json:"max_conn"`           // 最大连接数
+			MaxIPConnections int    `json:"max_ip_connections"` // 单IP最大连接数
+			QuotaPeriod      string `json:"quota_period"`       // 配额周期（daily/weekly/monthly/custom/unlimited）
+			QuotaBytes       int64  `json:"quota_bytes"`        // 配额大小（字节）
+			QuotaStartTime   int64  `json:"quota_start_time"`   // 配额开始时间（自定义周期）
+			QuotaEndTime     int64  `json:"quota_end_time"`     // 配额结束时间（自定义周期）
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
@@ -478,26 +604,32 @@ func (ws *WebServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// 添加用户到认证系统
 		if err := ws.auth.AddUser(data.Username, data.Password); err != nil {
 			log.Printf("创建用户失败 [%s]: %v", data.Username, err)
 			http.Error(w, fmt.Sprintf("用户创建失败：%v", err), http.StatusBadRequest)
 			return
 		}
 
+		// 设置速度限制
 		readLimit, _ := validateSpeedLimit(data.ReadLimit)
 		writeLimit, _ := validateSpeedLimit(data.WriteLimit)
 		if readLimit > 0 || writeLimit > 0 {
 			ws.auth.SetUserSpeedLimit(data.Username, readLimit, writeLimit)
 		}
 
+		// 设置最大连接数
 		maxConn, _ := validateMaxConnections(data.MaxConn)
 		ws.auth.SetUserMaxConnections(data.Username, maxConn)
 
+		// 设置单 IP 最大连接数
 		maxIPConn, _ := validateMaxConnections(data.MaxIPConnections)
 		ws.auth.SetUserMaxIPConnections(data.Username, maxIPConn)
 
+		// 设置流量配额
 		if data.QuotaPeriod != "" {
 			ws.auth.SetUserQuota(data.Username, data.QuotaPeriod, data.QuotaBytes)
+			// 如果是自定义时间段，设置起止时间
 			if data.QuotaPeriod == "custom" && data.QuotaStartTime > 0 && data.QuotaEndTime > 0 {
 				if user, exists := ws.auth.GetUser(data.Username); exists {
 					user.QuotaStartTime = data.QuotaStartTime
@@ -525,6 +657,7 @@ func (ws *WebServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 
 	case "PUT":
+		// 更新用户信息
 		username := r.URL.Query().Get("username")
 		if username == "" {
 			http.Error(w, "缺少用户名参数", http.StatusBadRequest)
@@ -615,6 +748,7 @@ func (ws *WebServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "DELETE":
+		// 删除用户
 		username := r.URL.Query().Get("username")
 		if username == "" {
 			http.Error(w, "缺少用户名参数", http.StatusBadRequest)
@@ -633,6 +767,7 @@ func (ws *WebServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleStats 处理统计信息 API。
 func (ws *WebServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	token := r.Header.Get("X-Auth-Token")
 	if token == "" {
@@ -682,6 +817,7 @@ func (ws *WebServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(data)
 }
 
+// handleTraffic 处理流量日志 API（当前返回空数组）。
 func (ws *WebServer) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	traffic := []map[string]interface{}{}
 
@@ -689,6 +825,7 @@ func (ws *WebServer) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(traffic)
 }
 
+// handleDashboard 处理仪表盘数据 API。
 func (ws *WebServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if ws.auth == nil {
 		log.Printf("错误：auth 为 nil")
@@ -747,6 +884,7 @@ func (ws *WebServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(data)
 }
 
+// handleUserQuota 处理用户配额设置 API（GET/PUT）。
 func (ws *WebServer) handleUserQuota(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
@@ -768,6 +906,7 @@ func (ws *WebServer) handleUserQuota(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "PUT":
+		// 设置用户配额
 		username := r.URL.Query().Get("username")
 		if username == "" {
 			http.Error(w, "缺少用户名参数", http.StatusBadRequest)
@@ -809,6 +948,7 @@ func (ws *WebServer) handleUserQuota(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"status":"success","message":"配额已设置"}`)
 
 	case "GET":
+		// 获取用户配额信息
 		username := r.URL.Query().Get("username")
 		if username == "" {
 			http.Error(w, "缺少用户名参数", http.StatusBadRequest)
@@ -833,6 +973,7 @@ func (ws *WebServer) handleUserQuota(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleQuotaStats 处理配额统计 API。
 func (ws *WebServer) handleQuotaStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
@@ -902,6 +1043,7 @@ func (ws *WebServer) handleQuotaStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// handleBatchSetQuota 处理批量设置配额 API。
 func (ws *WebServer) handleBatchSetQuota(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
@@ -998,6 +1140,7 @@ func (ws *WebServer) handleBatchSetQuota(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(response)
 }
 
+// parseTimeString 解析多种格式的时间字符串。
 func parseTimeString(timeStr string) (int64, error) {
 	if timestamp, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
 		return timestamp, nil
@@ -1018,10 +1161,14 @@ func parseTimeString(timeStr string) (int64, error) {
 	return 0, fmt.Errorf("无法解析时间格式：%s (支持时间戳、RFC3339、ISO8601 等格式)", timeStr)
 }
 
+// initDefaultAdmin 初始化默认管理员账户（admin / password123）。
+// 仅在首次启动且数据库中没有管理员时创建。
+// 生产环境应及时修改默认密码。
 func (ws *WebServer) initDefaultAdmin() {
 	ws.adminMu.Lock()
 	defer ws.adminMu.Unlock()
 
+	// 如果已存在 admin 用户，则不重复创建
 	if _, exists := ws.adminUsers["admin"]; exists {
 		return
 	}
@@ -1036,6 +1183,14 @@ func (ws *WebServer) initDefaultAdmin() {
 	log.Println("默认管理员账户已初始化：admin / password123（请及时修改密码）")
 }
 
+// hashPasswordForAdmin 使用 bcrypt 加密管理员密码。
+// bcrypt 是一种安全的密码哈希算法，具有抗暴力破解能力。
+//
+// 参数:
+//   - password: 明文密码
+//
+// 返回:
+//   - string: bcrypt 哈希后的密码字符串
 func hashPasswordForAdmin(password string) string {
 	hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
@@ -1045,12 +1200,23 @@ func hashPasswordForAdmin(password string) string {
 	return string(hashed)
 }
 
+// verifyAdminPassword 验证管理员密码。
+// 使用 bcrypt 比较明文密码和哈希值。
+// 即使用户不存在，也会执行一次哈希比较，防止时序攻击。
+//
+// 参数:
+//   - username: 用户名
+//   - password: 明文密码
+//
+// 返回:
+//   - bool: 密码是否正确
 func (ws *WebServer) verifyAdminPassword(username, password string) bool {
 	ws.adminMu.RLock()
 	defer ws.adminMu.RUnlock()
 
 	admin, exists := ws.adminUsers[username]
 	if !exists || !admin.Enabled {
+		// 用户不存在或已禁用，执行一次空比较以防止时序攻击
 		bcrypt.CompareHashAndPassword([]byte(""), []byte(password))
 		return false
 	}
@@ -1059,33 +1225,53 @@ func (ws *WebServer) verifyAdminPassword(username, password string) bool {
 	return err == nil
 }
 
+// generateSessionToken 生成随机会话令牌（64 字符十六进制）。
+// 使用加密安全的随机数生成器，确保令牌不可预测。
+//
+// 返回:
+//   - string: 64 字符的十六进制字符串
+//   - error: 随机数生成错误
 func generateSessionToken() (string, error) {
-	bytes := make([]byte, 32)
+	bytes := make([]byte, 32) // 32 字节 = 64 字符十六进制
 	if _, err := rand.Read(bytes); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(bytes), nil
 }
 
+// createSession 创建新的管理员会话。
+// 生成唯一的会话令牌，并记录会话信息。
+// 同时更新管理员的登录统计信息。
+//
+// 参数:
+//   - username: 管理员用户名
+//   - clientIP: 客户端 IP 地址
+//
+// 返回:
+//   - string: 会话令牌
+//   - error: 创建错误
 func (ws *WebServer) createSession(username, clientIP string) (string, error) {
 	token, err := generateSessionToken()
 	if err != nil {
 		return "", err
 	}
 
+	// 创建会话对象，设置过期时间
 	session := &Session{
 		Token:        token,
 		Username:     username,
-		ExpireTime:   time.Now().Add(24 * time.Hour).Unix(),
+		ExpireTime:   time.Now().Add(24 * time.Hour).Unix(), // 24小时后绝对过期
 		ClientIP:     clientIP,
 		CreateTime:   time.Now().Unix(),
 		LastActivity: time.Now().Unix(),
 	}
 
+	// 保存会话到内存
 	ws.sessionMu.Lock()
 	defer ws.sessionMu.Unlock()
 	ws.sessions[token] = session
 
+	// 更新管理员登录统计
 	ws.adminMu.Lock()
 	if admin, exists := ws.adminUsers[username]; exists {
 		admin.LastLogin = time.Now().Unix()
@@ -1097,10 +1283,20 @@ func (ws *WebServer) createSession(username, clientIP string) (string, error) {
 }
 
 const (
-	SessionTimeout       = 30 * 60
-	SessionMaxExpireTime = 24 * 60 * 60
+	SessionTimeout       = 30 * 60      // 会话超时时间：30 分钟（无活动后失效）
+	SessionMaxExpireTime = 24 * 60 * 60 // 会话最大有效期：24 小时（从创建时计算）
 )
 
+// validateSession 验证会话令牌的有效性。
+// 检查会话是否存在、是否过期、是否超过空闲超时。
+// 如果会话无效，返回 nil, false。
+//
+// 参数:
+//   - token: 会话令牌
+//
+// 返回:
+//   - *Session: 会话对象（如果有效）
+//   - bool: 会话是否有效
 func (ws *WebServer) validateSession(token string) (*Session, bool) {
 	ws.sessionMu.RLock()
 	defer ws.sessionMu.RUnlock()
@@ -1110,14 +1306,17 @@ func (ws *WebServer) validateSession(token string) (*Session, bool) {
 		return nil, false
 	}
 
+	// 检查是否超过最大有效期（绝对过期）
 	if time.Now().Unix() > session.ExpireTime {
 		log.Printf("会话已过期：用户=%s", session.Username)
 		return nil, false
 	}
 
+	// 检查是否超过空闲超时（30分钟无活动）
 	now := time.Now().Unix()
 	if now-session.LastActivity > SessionTimeout {
 		log.Printf("会话超时（30 分钟未活动）：用户=%s, IP=%s", session.Username, session.ClientIP)
+		// 异步使会话失效，避免阻塞
 		go ws.invalidateSession(token)
 		return nil, false
 	}
@@ -1125,12 +1324,25 @@ func (ws *WebServer) validateSession(token string) (*Session, bool) {
 	return session, true
 }
 
+// invalidateSession 使会话失效。
+// 从会话映射中删除指定的会话令牌。
+//
+// 参数:
+//   - token: 要失效的会话令牌
 func (ws *WebServer) invalidateSession(token string) {
 	ws.sessionMu.Lock()
 	defer ws.sessionMu.Unlock()
 	delete(ws.sessions, token)
 }
 
+// refreshSessionActivity 刷新会话的最后活动时间。
+// 用于延长会话的空闲超时时间，每次请求都会调用。
+//
+// 参数:
+//   - token: 会话令牌
+//
+// 返回:
+//   - bool: 是否成功刷新
 func (ws *WebServer) refreshSessionActivity(token string) bool {
 	ws.sessionMu.Lock()
 	defer ws.sessionMu.Unlock()
@@ -1144,6 +1356,7 @@ func (ws *WebServer) refreshSessionActivity(token string) bool {
 	return true
 }
 
+// getAdminUser 获取管理员用户信息。
 func (ws *WebServer) getAdminUser(username string) *AdminUser {
 	ws.adminMu.RLock()
 	defer ws.adminMu.RUnlock()
@@ -1154,6 +1367,14 @@ func (ws *WebServer) getAdminUser(username string) *AdminUser {
 	return nil
 }
 
+// isAccountLocked 检查管理员账户是否被锁定。
+// 如果账户被锁定且锁定时间已过，自动解锁。
+//
+// 参数:
+//   - username: 用户名
+//
+// 返回:
+//   - bool: 账户是否被锁定
 func (ws *WebServer) isAccountLocked(username string) bool {
 	ws.adminMu.RLock()
 	defer ws.adminMu.RUnlock()
@@ -1165,10 +1386,12 @@ func (ws *WebServer) isAccountLocked(username string) bool {
 
 	now := time.Now().Unix()
 
+	// 检查是否在锁定期内
 	if admin.LockUntil > now {
 		return true
 	}
 
+	// 如果锁定时间已过，自动解锁
 	if admin.LockUntil > 0 && admin.LockUntil <= now {
 		ws.adminMu.RUnlock()
 		ws.adminMu.Lock()
@@ -1181,6 +1404,11 @@ func (ws *WebServer) isAccountLocked(username string) bool {
 	return false
 }
 
+// recordLoginFailure 记录登录失败，达到阈值后锁定账户。
+// 防止暴力破解攻击，连续失败 MaxLoginFailCount 次后锁定账户 LoginLockDuration 时间。
+//
+// 参数:
+//   - username: 用户名
 func (ws *WebServer) recordLoginFailure(username string) {
 	ws.adminMu.Lock()
 	defer ws.adminMu.Unlock()
@@ -1192,6 +1420,7 @@ func (ws *WebServer) recordLoginFailure(username string) {
 
 	now := time.Now().Unix()
 
+	// 如果距离上次失败已超过重置时间，清零计数
 	if admin.LastLoginFailTime > 0 && now-admin.LastLoginFailTime > LoginFailResetTime {
 		admin.LoginFailCount = 0
 	}
@@ -1199,12 +1428,18 @@ func (ws *WebServer) recordLoginFailure(username string) {
 	admin.LoginFailCount++
 	admin.LastLoginFailTime = now
 
+	// 达到最大失败次数，锁定账户
 	if admin.LoginFailCount >= MaxLoginFailCount {
 		admin.LockUntil = now + LoginLockDuration
 		log.Printf("账户已被锁定：用户名=%s, 锁定时间=%d分钟", username, LoginLockDuration/60)
 	}
 }
 
+// clearLoginFailure 清除登录失败记录。
+// 在成功登录后调用，重置失败计数和锁定状态。
+//
+// 参数:
+//   - username: 用户名
 func (ws *WebServer) clearLoginFailure(username string) {
 	ws.adminMu.Lock()
 	defer ws.adminMu.Unlock()
@@ -1219,6 +1454,11 @@ func (ws *WebServer) clearLoginFailure(username string) {
 	admin.LockUntil = 0
 }
 
+// clearExistingSessions 清除指定用户的所有现有会话。
+// 用于确保同一用户只有一个活跃会话，提高安全性。
+//
+// 参数:
+//   - username: 用户名
 func (ws *WebServer) clearExistingSessions(username string) {
 	ws.sessionMu.Lock()
 	defer ws.sessionMu.Unlock()
@@ -1231,8 +1471,12 @@ func (ws *WebServer) clearExistingSessions(username string) {
 	}
 }
 
+// authMiddleware 认证中间件，保护需要登录的 API。
+// 检查请求是否包含有效的会话令牌，对修改操作进行 CSRF 验证。
+// 公开路径（如登录、验证码）无需认证。
 func (ws *WebServer) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 公开路径，无需认证
 		publicPaths := []string{"/", "/api/admin/login", "/api/admin/captcha", "/static/"}
 		for _, path := range publicPaths {
 			if strings.HasPrefix(r.URL.Path, path) {
@@ -1241,6 +1485,7 @@ func (ws *WebServer) authMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
+		// 从 Cookie 或 Header 提取 Token
 		token := getCookie(r, "session_token")
 
 		if token == "" {
@@ -1258,14 +1503,17 @@ func (ws *WebServer) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// 验证会话令牌
 		session, valid := ws.validateSession(token)
 		if !valid {
 			http.Error(w, `{"error":"会话已过期或无效","code":"SESSION_EXPIRED"}`, http.StatusUnauthorized)
 			return
 		}
 
+		// 刷新会话活动时间，延长会话有效期
 		ws.refreshSessionActivity(token)
 
+		// 对修改操作进行 CSRF 验证（POST/PUT/DELETE）
 		if r.Method == "POST" || r.Method == "PUT" || r.Method == "DELETE" {
 			csrfToken := r.Header.Get("X-CSRF-Token")
 			if csrfToken == "" {
@@ -1284,11 +1532,14 @@ func (ws *WebServer) authMiddleware(next http.Handler) http.Handler {
 }
 
 const (
-	MaxLoginFailCount  = 5
-	LoginLockDuration  = 15 * 60
-	LoginFailResetTime = 30 * 60
+	MaxLoginFailCount  = 5       // 最大登录失败次数（超过后锁定账户）
+	LoginLockDuration  = 15 * 60 // 账户锁定时长：15 分钟
+	LoginFailResetTime = 30 * 60 // 失败计数重置时间：30 分钟（无失败后清零）
 )
 
+// handleAdminLogin 处理管理员登录 API。
+// 验证用户名、密码、验证码，创建会话并返回令牌。
+// 包含账户锁定、验证码验证、首次登录强制改密等安全机制。
 func (ws *WebServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
@@ -1298,8 +1549,8 @@ func (ws *WebServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 	var data struct {
 		Username  string `json:"username"`
 		Password  string `json:"password"`
-		CaptchaID string `json:"captcha_id"`
-		Captcha   string `json:"captcha"`
+		CaptchaID string `json:"captcha_id"` // 验证码 ID
+		Captcha   string `json:"captcha"`    // 用户输入的验证码
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
@@ -1307,29 +1558,34 @@ func (ws *WebServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 检查账户是否被锁定
 	if ws.isAccountLocked(data.Username) {
 		log.Printf("管理员登录失败：账户已锁定，用户名=%s, IP=%s", data.Username, r.RemoteAddr)
 		http.Error(w, `{"error":"账户已被锁定，请15分钟后再试","code":"ACCOUNT_LOCKED"}`, http.StatusTooManyRequests)
 		return
 	}
 
+	// 验证验证码（防止自动化攻击）
 	if !ws.verifyCaptcha(data.CaptchaID, data.Captcha) {
 		log.Printf("管理员登录失败：验证码错误，用户名=%s, IP=%s", data.Username, r.RemoteAddr)
 		http.Error(w, `{"error":"验证码错误","code":"CAPTCHA_FAILED"}`, http.StatusBadRequest)
 		return
 	}
 
+	// 验证密码
 	if !ws.verifyAdminPassword(data.Username, data.Password) {
 		log.Printf("管理员登录失败：用户名=%s, IP=%s", data.Username, r.RemoteAddr)
-		ws.recordLoginFailure(data.Username)
+		ws.recordLoginFailure(data.Username) // 记录失败次数
 		http.Error(w, `{"error":"用户名或密码错误","code":"AUTH_FAILED"}`, http.StatusUnauthorized)
 		return
 	}
 
+	// 登录成功，清除失败记录
 	ws.clearLoginFailure(data.Username)
 
 	admin := ws.getAdminUser(data.Username)
 	if admin != nil && admin.ForcePasswordChange {
+		// 首次登录，强制修改密码
 		token, err := ws.createSession(data.Username, r.RemoteAddr)
 		if err != nil {
 			log.Printf("创建会话失败：%v", err)
@@ -1345,8 +1601,10 @@ func (ws *WebServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 清除旧会话（确保单点登录）
 	ws.clearExistingSessions(data.Username)
 
+	// 创建新会话
 	token, err := ws.createSession(data.Username, r.RemoteAddr)
 	if err != nil {
 		log.Printf("创建会话失败：%v", err)
@@ -1356,16 +1614,19 @@ func (ws *WebServer) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("管理员登录成功：用户名=%s, IP=%s", data.Username, r.RemoteAddr)
 
+	// 生成 CSRF 令牌
 	csrfToken := ws.generateCSRFToken(data.Username)
 
 	w.Header().Set("Content-Type", "application/json")
 
-	ws.setSecureCookie(w, "session_token", token, 86400)
-	ws.setSecureCookie(w, "csrf_token", csrfToken, 86400)
+	// 设置安全的 Cookie
+	ws.setSecureCookie(w, "session_token", token, 86400)  // 24小时
+	ws.setSecureCookie(w, "csrf_token", csrfToken, 86400) // 24小时
 
 	fmt.Fprintf(w, `{"status":"success","token":"%s","username":"%s","csrf_token":"%s"}`, token, data.Username, csrfToken)
 }
 
+// handleAdminLogout 处理管理员登出 API。
 func (ws *WebServer) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
@@ -1393,6 +1654,7 @@ func (ws *WebServer) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"success","message":"已安全退出"}`)
 }
 
+// handleAdminCheck 检查管理员登录状态。
 func (ws *WebServer) handleAdminCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
@@ -1432,28 +1694,34 @@ func (ws *WebServer) handleAdminCheck(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"success","logged_in":true,"username":"%s"}`, session.Username)
 }
 
+// handleCaptcha 生成并返回验证码图片。
+// 每次请求生成一个新的验证码，存储到内存中，有效期5分钟。
+// 返回 PNG 格式的图片，并在响应头中包含验证码 ID。
 func (ws *WebServer) handleCaptcha(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
+	// 生成唯一的验证码 ID（基于时间戳）
 	captchaID := fmt.Sprintf("%d", time.Now().UnixNano())
 	code, img := ws.generateCaptcha()
 
+	// 存储验证码信息到内存
 	ws.captchaMu.Lock()
 	if ws.captchaStore == nil {
 		ws.captchaStore = make(map[string]*CaptchaInfo)
 	}
 	ws.captchaStore[captchaID] = &CaptchaInfo{
 		Code:     code,
-		ExpireAt: time.Now().Add(5 * time.Minute).Unix(),
+		ExpireAt: time.Now().Add(5 * time.Minute).Unix(), // 5分钟有效期
 	}
 	ws.captchaMu.Unlock()
 
+	// 设置响应头
 	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("X-Captcha-ID", captchaID)
-	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("X-Captcha-ID", captchaID)                              // 返回验证码 ID，供前端提交时使用
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate") // 禁止缓存
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
 	if err := png.Encode(w, img); err != nil {
@@ -1461,6 +1729,16 @@ func (ws *WebServer) handleCaptcha(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// verifyCaptcha 验证用户输入的验证码是否正确。
+// 不区分大小写比较，验证成功后立即销毁验证码（一次性使用）。
+// 失败次数超过5次也会销毁，防止暴力破解。
+//
+// 参数:
+//   - captchaID: 验证码 ID
+//   - code: 用户输入的验证码
+//
+// 返回:
+//   - bool: 验证码是否正确
 func (ws *WebServer) verifyCaptcha(captchaID, code string) bool {
 	ws.captchaMu.RLock()
 	info, exists := ws.captchaStore[captchaID]
@@ -1470,6 +1748,7 @@ func (ws *WebServer) verifyCaptcha(captchaID, code string) bool {
 		return false
 	}
 
+	// 检查是否过期
 	if time.Now().Unix() > info.ExpireAt {
 		ws.captchaMu.Lock()
 		delete(ws.captchaStore, captchaID)
@@ -1477,15 +1756,19 @@ func (ws *WebServer) verifyCaptcha(captchaID, code string) bool {
 		return false
 	}
 
+	// 不区分大小写比较
 	if strings.EqualFold(info.Code, code) {
+		// 验证成功，立即销毁验证码（一次性使用）
 		ws.captchaMu.Lock()
 		delete(ws.captchaStore, captchaID)
 		ws.captchaMu.Unlock()
 		return true
 	}
 
+	// 验证失败，增加失败计数
 	info.FailCount++
 	if info.FailCount >= 5 {
+		// 失败次数过多，销毁验证码
 		ws.captchaMu.Lock()
 		delete(ws.captchaStore, captchaID)
 		ws.captchaMu.Unlock()
@@ -1494,6 +1777,7 @@ func (ws *WebServer) verifyCaptcha(captchaID, code string) bool {
 	return false
 }
 
+// handleChangePassword 处理修改管理员密码 API。
 func (ws *WebServer) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
@@ -1535,17 +1819,20 @@ func (ws *WebServer) handleChangePassword(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// 验证旧密码
 	if !ws.verifyAdminPassword(session.Username, data.OldPassword) {
 		log.Printf("修改密码失败：旧密码错误，用户名=%s, IP=%s", session.Username, r.RemoteAddr)
 		http.Error(w, `{"error":"原密码错误","code":"WRONG_PASSWORD"}`, http.StatusBadRequest)
 		return
 	}
 
+	// 检查新密码强度
 	if len(data.NewPassword) < 6 {
 		http.Error(w, `{"error":"密码长度至少为 6 位","code":"WEAK_PASSWORD"}`, http.StatusBadRequest)
 		return
 	}
 
+	// 更新密码
 	ws.adminMu.Lock()
 	adminUser, exists := ws.adminUsers[session.Username]
 	if !exists {
@@ -1567,6 +1854,7 @@ func (ws *WebServer) handleChangePassword(w http.ResponseWriter, r *http.Request
 	ws.adminUsers[session.Username] = adminUser
 	ws.adminMu.Unlock()
 
+	// 保存到数据库
 	if ws.db != nil {
 		if err := ws.db.SaveAdminUser(session.Username, adminUser.PasswordHash, adminUser.Enabled); err != nil {
 			log.Printf("保存管理员密码到数据库失败：%v", err)
@@ -1581,6 +1869,7 @@ func (ws *WebServer) handleChangePassword(w http.ResponseWriter, r *http.Request
 	fmt.Fprintf(w, `{"status":"success","message":"密码修改成功"}`)
 }
 
+// handleGetAuthMethod 获取当前认证方式。
 func (ws *WebServer) handleGetAuthMethod(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
@@ -1630,6 +1919,7 @@ func (ws *WebServer) handleGetAuthMethod(w http.ResponseWriter, r *http.Request)
 	fmt.Fprintf(w, `{"status":"success","auth_method":"%s"}`, authMethod)
 }
 
+// handleSetAuthMethod 设置认证方式（none/password）。
 func (ws *WebServer) handleSetAuthMethod(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
@@ -1699,6 +1989,7 @@ func (ws *WebServer) handleSetAuthMethod(w http.ResponseWriter, r *http.Request)
 	}[data.AuthMethod])
 }
 
+// handleGetConfig 获取服务器配置。
 func (ws *WebServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	var token string
@@ -1753,6 +2044,7 @@ func (ws *WebServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 从内存配置补充
 	if ws.socksServer != nil {
 		if _, exists := config["listen_addr"]; !exists {
 			config["listen_addr"] = ws.socksServer.config.ListenAddr
@@ -1780,6 +2072,7 @@ func (ws *WebServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"success","config":%s}`, mapToJSON(config))
 }
 
+// handleSetConfig 设置服务器配置。
 func (ws *WebServer) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed)
@@ -1826,6 +2119,7 @@ func (ws *WebServer) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 防重复提交
 	if data.SubmitToken == "" {
 		http.Error(w, `{"error":"无效的提交请求"}`, http.StatusBadRequest)
 		return
@@ -1838,6 +2132,7 @@ func (ws *WebServer) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 
 	ws.recordSubmitToken(data.SubmitToken)
 
+	// XSS 和 SQL 注入检测
 	validator := NewInputValidator()
 	if validator.ContainsXSS(data.ListenAddr) {
 		http.Error(w, `{"error":"监听地址包含非法内容"}`, http.StatusBadRequest)
@@ -1862,6 +2157,7 @@ func (ws *WebServer) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 保存到数据库
 	if ws.db != nil {
 		listenAddr, _ := validated["listen_addr"].(string)
 		ws.db.SetConfig("listen_addr", listenAddr, "服务器监听地址")
@@ -1888,6 +2184,14 @@ func (ws *WebServer) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"status":"success","message":"配置已保存，重启服务器后生效"}`)
 }
 
+// isDuplicateSubmit 检查是否为重复提交。
+// 通过检查提交令牌是否已存在来判断。
+//
+// 参数:
+//   - token: 提交令牌
+//
+// 返回:
+//   - bool: 是否为重复提交
 func (ws *WebServer) isDuplicateSubmit(token string) bool {
 	ws.submitMu.RLock()
 	defer ws.submitMu.RUnlock()
@@ -1896,12 +2200,19 @@ func (ws *WebServer) isDuplicateSubmit(token string) bool {
 	return exists
 }
 
+// recordSubmitToken 记录提交令牌，用于防重复提交。
+// 将令牌和时间戳存储到内存中，并清理过期的令牌（5分钟前）。
+//
+// 参数:
+//   - token: 提交令牌
 func (ws *WebServer) recordSubmitToken(token string) {
 	ws.submitMu.Lock()
 	defer ws.submitMu.Unlock()
 
+	// 记录当前提交令牌
 	ws.submitTokens[token] = time.Now().UnixNano()
 
+	// 清理过期的令牌（5分钟前）
 	expireTime := time.Now().Add(-5 * time.Minute).UnixNano()
 	for t, ts := range ws.submitTokens {
 		if ts < expireTime {
@@ -1910,6 +2221,15 @@ func (ws *WebServer) recordSubmitToken(token string) {
 	}
 }
 
+// mapToJSON 将 map 转换为 JSON 字符串。
+// 用于将配置数据序列化为 JSON 格式返回给前端。
+// 如果转换失败，返回空对象 {}。
+//
+// 参数:
+//   - m: 要转换的 map
+//
+// 返回:
+//   - string: JSON 字符串
 func mapToJSON(m map[string]interface{}) string {
 	if len(m) == 0 {
 		return "{}"
@@ -1921,33 +2241,61 @@ func mapToJSON(m map[string]interface{}) string {
 	return string(data)
 }
 
+// generateCSRFSecret 生成随机的 CSRF 密钥。
+// 在服务器启动时调用一次，用于生成和验证 CSRF 令牌。
+// 如果随机数生成失败，使用备用方案（基于时间戳）。
+//
+// 返回:
+//   - []byte: 32字节的 CSRF 密钥
 func generateCSRFSecret() []byte {
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
 		log.Printf("警告：随机数生成失败，使用备用 CSRF 密钥")
+		// 备用方案：使用时间戳（安全性较低，但能保证功能）
 		secret = []byte(fmt.Sprintf("csrf_secret_%d", time.Now().UnixNano()))
 	}
 	return secret
 }
 
+// generateCSRFToken 生成 CSRF 令牌。
+// 基于 CSRF 密钥、用户名和时间戳生成唯一的令牌。
+// 用于防止跨站请求伪造攻击。
+//
+// 参数:
+//   - username: 管理员用户名
+//
+// 返回:
+//   - string: 64字符的十六进制 CSRF 令牌
 func (ws *WebServer) generateCSRFToken(username string) string {
 	h := sha256.New()
-	h.Write(ws.csrfSecret)
-	h.Write([]byte(username))
-	h.Write([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+	h.Write(ws.csrfSecret)                                    // CSRF 密钥
+	h.Write([]byte(username))                                 // 用户名
+	h.Write([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))) // 时间戳（增加随机性）
 
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// validateCSRFToken 验证 CSRF 令牌的格式有效性。
+// 检查令牌是否为空、长度是否正确、是否只包含十六进制字符。
+// 注意：此函数只验证格式，不验证令牌的真实性（真实性由生成逻辑保证）。
+//
+// 参数:
+//   - token: CSRF 令牌
+//   - username: 管理员用户名（保留参数，便于未来扩展）
+//
+// 返回:
+//   - bool: 令牌格式是否有效
 func (ws *WebServer) validateCSRFToken(token, username string) bool {
 	if token == "" || username == "" {
 		return false
 	}
 
+	// CSRF 令牌应该是 64 字符的十六进制字符串（SHA-256 哈希）
 	if len(token) != 64 {
 		return false
 	}
 
+	// 检查是否只包含合法的十六进制字符
 	for _, c := range token {
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
 			return false
@@ -1957,38 +2305,55 @@ func (ws *WebServer) validateCSRFToken(token, username string) bool {
 	return true
 }
 
+// setSecurityHeaders 设置安全相关的 HTTP 响应头。
+// 包括 XSS 防护、点击劫持防护、MIME 类型嗅探防护等。
+// 这是一个中间件函数，包裹在其他处理器外部。
 func setSecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-
-		w.Header().Set("X-Frame-Options", "DENY")
-
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
-
+		w.Header().Set("X-Content-Type-Options", "nosniff") // 禁止 MIME 类型嗅探
+		w.Header().Set("X-Frame-Options", "DENY")           // 禁止 iframe 嵌入（防点击劫持）
+		w.Header().Set("X-XSS-Protection", "1; mode=block") // 启用浏览器 XSS 过滤器
+		// 内容安全策略：限制资源加载来源
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:")
-
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-
-		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")             // 引用策略
+		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()") // 权限策略
 
 		next.ServeHTTP(w, r)
 	})
 }
 
+// setSecureCookie 设置安全的 HTTP Cookie。
+// 配置 HttpOnly、Secure、SameSite 等属性，增强安全性。
+//
+// 参数:
+//   - w: HTTP 响应写入器
+//   - name: Cookie 名称
+//   - value: Cookie 值
+//   - maxAge: 最大存活时间（秒），负数表示删除 Cookie
 func (ws *WebServer) setSecureCookie(w http.ResponseWriter, name, value string, maxAge int) {
+	// 是否强制使用 Secure 标志（仅 HTTPS）
 	secure := strings.ToLower(getEnv("FORCE_COOKIE_SECURE", "false")) == "true"
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     name,
 		Value:    value,
 		Path:     "/",
-		HttpOnly: true,
-		Secure:   secure,
-		SameSite: http.SameSiteLaxMode,
+		HttpOnly: true,                 // 禁止 JavaScript 访问，防止 XSS 窃取
+		Secure:   secure,               // 仅通过 HTTPS 传输（可通过环境变量强制）
+		SameSite: http.SameSiteLaxMode, // 防止 CSRF 攻击
 		MaxAge:   maxAge,
 	})
 }
 
+// getCookie 从请求中获取指定名称的 Cookie 值。
+// 如果 Cookie 不存在，返回空字符串。
+//
+// 参数:
+//   - r: HTTP 请求
+//   - name: Cookie 名称
+//
+// 返回:
+//   - string: Cookie 值
 func getCookie(r *http.Request, name string) string {
 	cookie, err := r.Cookie(name)
 	if err != nil {
@@ -1997,6 +2362,15 @@ func getCookie(r *http.Request, name string) string {
 	return cookie.Value
 }
 
+// getEnv 获取环境变量，如果未设置则返回默认值。
+// 用于配置可选的行为，如强制 Cookie Secure 标志。
+//
+// 参数:
+//   - key: 环境变量名
+//   - defaultValue: 默认值
+//
+// 返回:
+//   - string: 环境变量值或默认值
 func getEnv(key, defaultValue string) string {
 	value := os.Getenv(key)
 	if value == "" {

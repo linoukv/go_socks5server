@@ -54,15 +54,14 @@ func NewTCPProxy(clientConn net.Conn, server *Server) *TCPProxy {
 		proxy.readSpeedLimit = server.config.ReadSpeedLimit
 		proxy.writeSpeedLimit = server.config.WriteSpeedLimit
 		proxy.needStats = server.stats != nil
-		proxy.needUserTraffic = server.config.EnableUserManagement
 		proxy.needReadLimit = proxy.readSpeedLimit > 0
 		proxy.needWriteLimit = proxy.writeSpeedLimit > 0
-		if proxy.needUserTraffic {
-			if auth, ok := server.config.Auth.(*PasswordAuth); ok {
-				proxy.authCache = auth
-			} else {
-				proxy.needUserTraffic = false
-			}
+
+		if auth, ok := server.config.Auth.(*PasswordAuth); ok {
+			proxy.authCache = auth
+			proxy.needUserTraffic = true
+		} else {
+			proxy.needUserTraffic = false
 		}
 	}
 	return proxy
@@ -70,23 +69,21 @@ func NewTCPProxy(clientConn net.Conn, server *Server) *TCPProxy {
 
 func (p *TCPProxy) SetUsername(username string) {
 	p.username = username
-	if p.server != nil && p.server.config != nil && p.server.config.EnableUserManagement {
-		if auth, ok := p.server.config.Auth.(*PasswordAuth); ok {
-			if user, exists := auth.GetUser(username); exists {
-				if user.ReadSpeedLimit > 0 {
-					p.readSpeedLimit = user.ReadSpeedLimit
-				}
-				if user.WriteSpeedLimit > 0 {
-					p.writeSpeedLimit = user.WriteSpeedLimit
-				}
-				p.needReadLimit = p.readSpeedLimit > 0
-				p.needWriteLimit = p.writeSpeedLimit > 0
+	if p.authCache != nil {
+		if user, exists := p.authCache.GetUser(username); exists {
+			if user.ReadSpeedLimit > 0 {
+				p.readSpeedLimit = user.ReadSpeedLimit
 			}
-			if auth.CheckQuotaExceeded(username) {
-				log.Printf("用户 [%s] 流量配额已用尽，拒绝连接", username)
-				p.clientConn.Close()
-				return
+			if user.WriteSpeedLimit > 0 {
+				p.writeSpeedLimit = user.WriteSpeedLimit
 			}
+			p.needReadLimit = p.readSpeedLimit > 0
+			p.needWriteLimit = p.writeSpeedLimit > 0
+		}
+		if p.authCache.CheckQuotaExceeded(username) {
+			log.Printf("用户 [%s] 流量配额已用尽，拒绝连接", username)
+			p.clientConn.Close()
+			return
 		}
 	}
 }
@@ -185,8 +182,8 @@ func (p *TCPProxy) copyWithStats(dst, src net.Conn, upload bool) {
 	const batchThreshold int64 = 256 * 1024
 	const flushThreshold int64 = 32 * 1024
 	const flushTimeout = 100 * time.Millisecond
-	const dbFlushInterval = 10 * time.Second
-	const dbBatchThreshold = 1 * 1024 * 1024
+	const dbFlushInterval = 5 * time.Second
+	const dbBatchThreshold = 100 * 1024
 	localUpload := int64(0)
 	localDownload := int64(0)
 	dbUpload := int64(0)
@@ -374,19 +371,17 @@ func (p *TCPProxy) Close() {
 		if p.remoteConn != nil {
 			p.remoteConn.Close()
 		}
-		if p.username != "" && p.server != nil && p.server.config != nil && p.server.config.EnableUserManagement {
-			if auth, ok := p.server.config.Auth.(*PasswordAuth); ok {
-				auth.DecrementUserConnection(p.username)
-				if p.clientConn != nil {
-					clientIP := p.clientConn.RemoteAddr().String()
-					auth.RemoveUserIP(p.username, clientIP)
-				}
-				if dbManager != nil {
-					pendingUpload := atomic.LoadInt64(&p.pendingUpload)
-					pendingDownload := atomic.LoadInt64(&p.pendingDownload)
-					if pendingUpload > 0 || pendingDownload > 0 {
-						dbManager.LogTraffic(p.username, pendingUpload, pendingDownload)
-					}
+		if p.username != "" && p.authCache != nil {
+			p.authCache.DecrementUserConnection(p.username)
+			if p.clientConn != nil {
+				clientIP := p.clientConn.RemoteAddr().String()
+				p.authCache.RemoveUserIP(p.username, clientIP)
+			}
+			if dbManager != nil {
+				pendingUpload := atomic.LoadInt64(&p.pendingUpload)
+				pendingDownload := atomic.LoadInt64(&p.pendingDownload)
+				if pendingUpload > 0 || pendingDownload > 0 {
+					dbManager.LogTraffic(p.username, pendingUpload, pendingDownload)
 				}
 			}
 		}
@@ -564,7 +559,7 @@ func (u *UDPAssociation) forwardToRemoteWithPool(header *UDPHeader, clientKey st
 					remoteConn = conn.(*net.UDPConn)
 				}
 				u.remoteConns[dstAddr] = remoteConn
-				log.Printf("[UDP] ✅ 新建连接 [%s] -> [%s]", clientKey, dstAddr)
+				log.Printf("[UDP] 新建连接 [%s] -> [%s]", clientKey, dstAddr)
 			}
 		} else {
 			u.remoteConnsMu.Unlock()
@@ -578,7 +573,7 @@ func (u *UDPAssociation) forwardToRemoteWithPool(header *UDPHeader, clientKey st
 	}
 	_, err := remoteConn.Write(header.Data)
 	if err != nil {
-		log.Printf("[UDP] ⚠️ 发送失败 [%s]: %v", dstAddr, err)
+		log.Printf("[UDP]  发送失败 [%s]: %v", dstAddr, err)
 		return
 	}
 

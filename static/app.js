@@ -583,13 +583,17 @@ function formatSpeed(speed) {
 }
 
 function formatQuota(period, total, used) {
-    if (!period || total === 0) return '不限流量';
+    if (!period) return '不限流量';
     
     let periodText = '';
     if (period === 'custom') {
         periodText = '自定义时间段';
     } else {
         periodText = { 'daily': '每日', 'weekly': '每周', 'monthly': '每月' }[period] || '';
+    }
+    
+    if (total === 0) {
+        return `${formatBytes(used)} (${periodText})`;
     }
     
     return `${formatBytes(used)}/${formatBytes(total)} (${periodText})`;
