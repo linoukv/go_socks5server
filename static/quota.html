@@ -90,6 +90,9 @@
                 <select id="filterQuotaType">
                     <option value="">所有配额类型</option>
                     <option value="custom">自定义时间段</option>
+                    <option value="daily">每日重置</option>
+                    <option value="weekly">每周重置</option>
+                    <option value="monthly">每月重置</option>
                     <option value="unlimited">无限制</option>
                 </select>
                 <select id="filterStatus">
@@ -148,6 +151,9 @@
                     <label>配额类型</label>
                     <select id="editQuotaPeriod" onchange="toggleEditTimeFields()">
                         <option value="custom">自定义时间段</option>
+                        <option value="daily">每日重置</option>
+                        <option value="weekly">每周重置</option>
+                        <option value="monthly">每月重置</option>
                         <option value="unlimited">无限制</option>
                     </select>
                 </div>
@@ -201,6 +207,9 @@
                     <label>配额类型</label>
                     <select id="batchQuotaPeriod" onchange="toggleBatchTimeFields()">
                         <option value="custom">自定义时间段</option>
+                        <option value="daily">每日重置</option>
+                        <option value="weekly">每周重置</option>
+                        <option value="monthly">每月重置</option>
                         <option value="unlimited">无限制</option>
                     </select>
                 </div>
@@ -406,6 +415,9 @@
                 let periodText = '';
                 switch(quotaInfo.quota_period) {
                     case 'custom': periodText = '自定义'; break;
+                    case 'daily': periodText = '每日重置'; break;
+                    case 'weekly': periodText = '每周重置'; break;
+                    case 'monthly': periodText = '每月重置'; break;
                     default: periodText = '无限制';
                 }
 
@@ -465,8 +477,8 @@
             if (quotaType) {
                 if (quotaType === 'unlimited') {
                     filtered = filtered.filter(u => !u.quota_bytes || u.quota_bytes === 0);
-                } else if (quotaType === 'custom') {
-                    filtered = filtered.filter(u => u.quota_period === 'custom');
+                } else if (quotaType === 'custom' || quotaType === 'daily' || quotaType === 'weekly' || quotaType === 'monthly') {
+                    filtered = filtered.filter(u => u.quota_period === quotaType);
                 }
                 console.log('[筛选] 配额类型筛选后:', filtered.length);
             }
@@ -581,10 +593,10 @@
             const quotaInput = document.getElementById('editQuotaBytes');
             const quotaGroup = quotaInput.closest('.form-group'); // 获取整个表单组
             
-            // 显示/隐藏时间选择框
+            // 显示/隐藏时间选择框，只有 custom 类型需要时间字段
             timeFields.style.display = period === 'custom' ? 'block' : 'none';
             
-            // ✅ 当选择"无限制"时，隐藏流量配额输入框
+            // 当选择"无限制"时，隐藏流量配额输入框
             if (period === 'unlimited') {
                 quotaInput.value = 0;
                 quotaInput.disabled = true;
@@ -741,10 +753,10 @@
             const batchQuotaInput = document.getElementById('batchQuotaBytes');
             const batchQuotaGroup = batchQuotaInput.closest('.form-group'); // 获取整个表单组
             
-            // 显示/隐藏时间选择框
+            // 显示/隐藏时间选择框，只有 custom 类型需要时间字段
             batchTimeFields.style.display = period === 'custom' ? 'block' : 'none';
             
-            // ✅ 当选择"无限制"时，隐藏流量配额输入框
+            // 当选择"无限制"时，隐藏流量配额输入框
             if (period === 'unlimited') {
                 batchQuotaInput.value = 0;
                 batchQuotaInput.disabled = true;

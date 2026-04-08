@@ -415,7 +415,7 @@ async function loadUsers() {
         
         if (users.length === 0) {
             console.log('⚠ 没有用户数据');
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: #999;">暂无用户</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #999;">暂无用户</td></tr>';
             return;
         }
         
@@ -424,8 +424,6 @@ async function loadUsers() {
             const tr = document.createElement('tr');
             tr.innerHTML = `
                 <td>${user.username || '未知'}</td>
-                <td>${formatSpeed(user.read_speed_limit)}</td>
-                <td>${formatSpeed(user.write_speed_limit)}</td>
                 <td>${user.max_connections || '∞'}</td>
                 <td>${user.max_ip_connections || '∞'}</td>
                 <td>${user.enabled ? '✅' : '❌'}</td>
@@ -455,8 +453,6 @@ document.getElementById('addUserForm').onsubmit = async function(e) {
     try {
         const userData = {
             username: document.getElementById('username').value,
-            read_limit: parseInt(document.getElementById('readLimit').value) || 0,
-            write_limit: parseInt(document.getElementById('writeLimit').value) || 0,
             max_conn: parseInt(document.getElementById('maxConn').value) || 0,
             max_ip_connections: parseInt(document.getElementById('maxIPConnections').value) || 0
         };
@@ -577,11 +573,6 @@ function formatBytes(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-function formatSpeed(speed) {
-    if (speed === 0) return '不限速';
-    return formatBytes(speed) + '/s';
-}
-
 function formatQuota(period, total, used) {
     if (!period) return '不限流量';
     
@@ -610,8 +601,6 @@ function resetUserForm() {
     document.getElementById('username').value = '';
     document.getElementById('username').readOnly = false;
     document.getElementById('password').value = '';
-    document.getElementById('readLimit').value = 0;
-    document.getElementById('writeLimit').value = 0;
     document.getElementById('maxConn').value = 0;
     document.getElementById('maxIPConnections').value = 0;
     document.getElementById('userModalTitle').textContent = '添加用户';
@@ -639,8 +628,6 @@ async function editUser(username) {
         document.getElementById('username').value = user.username;
         document.getElementById('username').readOnly = true;
         document.getElementById('password').value = '';
-        document.getElementById('readLimit').value = user.read_speed_limit || 0;
-        document.getElementById('writeLimit').value = user.write_speed_limit || 0;
         document.getElementById('maxConn').value = user.max_connections || 0;
         document.getElementById('maxIPConnections').value = user.max_ip_connections || 0;
         
@@ -684,8 +671,6 @@ async function showConfigModal() {
             document.getElementById('configListenAddr').value = config.listen_addr || '';
             document.getElementById('configMaxWorkers').value = config.max_workers || '';
             document.getElementById('configMaxConnPerIP').value = config.max_conn_per_ip || '';
-            document.getElementById('configReadSpeedLimit').value = config.read_speed_limit || '';
-            document.getElementById('configWriteSpeedLimit').value = config.write_speed_limit || '';
             document.getElementById('configTCPKeepAlive').value = config.tcp_keepalive_period || '';
             
             console.log('配置填充完成');
@@ -796,12 +781,6 @@ function validateConfigInput(config) {
     if (config.max_conn_per_ip < 0 || config.max_conn_per_ip > 65535) {
         errors.push('❌ 单 IP 最大连接数必须在 0-65535 之间');
     }
-    if (config.read_speed_limit < 0 || config.read_speed_limit > 10737418240) {
-        errors.push('❌ 上传速度限制过大');
-    }
-    if (config.write_speed_limit < 0 || config.write_speed_limit > 10737418240) {
-        errors.push('❌ 下载速度限制过大');
-    }
     if (config.tcp_keepalive_period < 0 || config.tcp_keepalive_period > 3600) {
         errors.push('❌ TCP Keepalive 周期必须在 0-3600 秒之间');
     }
@@ -830,8 +809,6 @@ async function saveConfig() {
         listen_addr: document.getElementById('configListenAddr').value.trim(),
         max_workers: parseInt(document.getElementById('configMaxWorkers').value) || 0,
         max_conn_per_ip: parseInt(document.getElementById('configMaxConnPerIP').value) || 0,
-        read_speed_limit: parseInt(document.getElementById('configReadSpeedLimit').value) || 0,
-        write_speed_limit: parseInt(document.getElementById('configWriteSpeedLimit').value) || 0,
         tcp_keepalive_period: parseInt(document.getElementById('configTCPKeepAlive').value) || 0
     };
     
