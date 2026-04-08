@@ -675,19 +675,6 @@ func (m *DatabaseManager) LoadAllUsersToAuth(auth *PasswordAuth) error {
 	return nil
 }
 
-// LogTraffic 记录用户流量日志（当前为空实现，保留接口）。
-//
-// 参数:
-//   - username: 用户名
-//   - upload: 上传流量
-//   - download: 下载流量
-//
-// 返回:
-//   - error: 始终返回 nil
-func (m *DatabaseManager) LogTraffic(username string, upload, download int64) error {
-	return nil // 空实现
-}
-
 // LogTotalTraffic 记录总流量日志。
 // 如果上传和下载都为 0，则跳过记录。
 //
@@ -715,54 +702,6 @@ func (m *DatabaseManager) LogTotalTraffic(upload, download int64) error {
 
 	_, err := m.db.Exec(query, upload, download, time.Now().Unix())
 	return err
-}
-
-// CleanOldTrafficLogs 清理旧的流量日志（当前为空实现，保留接口）。
-//
-// 参数:
-//   - retentionDays: 保留天数
-//
-// 返回:
-//   - error: 始终返回 nil
-func (m *DatabaseManager) CleanOldTrafficLogs(retentionDays int) error {
-	return nil // 空实现
-}
-
-// GetTrafficLogsCount 获取流量日志数量（当前为空实现，保留接口）。
-//
-// 返回:
-//   - int64: 始终返回 0
-//   - error: 始终返回 nil
-func (m *DatabaseManager) GetTrafficLogsCount() (int64, error) {
-	return 0, nil // 空实现
-}
-
-// GetTrafficStats 获取指定时间段内的流量统计（当前为空实现，保留接口）。
-//
-// 参数:
-//   - username: 用户名
-//   - startTime: 开始时间
-//   - endTime: 结束时间
-//
-// 返回:
-//   - totalUpload: 总上传流量
-//   - totalDownload: 总下载流量
-//   - error: 错误
-func (m *DatabaseManager) GetTrafficStats(username string, startTime, endTime int64) (totalUpload, totalDownload int64, err error) {
-	return 0, 0, nil // 空实现
-}
-
-// GetUserTrafficReport 获取用户流量报告（当前为空实现，保留接口）。
-//
-// 参数:
-//   - username: 用户名
-//   - days: 天数
-//
-// 返回:
-//   - []map[string]interface{}: 空的报告列表
-//   - error: 错误
-func (m *DatabaseManager) GetUserTrafficReport(username string, days int) ([]map[string]interface{}, error) {
-	return []map[string]interface{}{}, nil // 空实现
 }
 
 // LogConnection 记录用户连接/断开事件。

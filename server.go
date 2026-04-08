@@ -7,7 +7,6 @@ package main
 import (
 	"context" // 上下文控制包，用于优雅关闭和超时控制
 	"fmt"     // 格式化输出包，提供字符串格式化和错误包装
-	"io"      // IO 接口包，定义 Reader/Writer 等基础接口
 	"log"     // 日志包，用于输出运行状态和错误信息
 	"net"     // 网络包，提供 TCP/UDP 网络连接功能
 	"runtime" // 运行时包，获取 CPU 核心数等系统信息
@@ -162,7 +161,7 @@ func (s *Server) Start() error {
 
 	// 如果启用了用户管理功能，启动数据持久化协程和配额重置协程
 	if s.config.EnableUserManagement {
-		// 每 10 秒将内存中的用户数据保存到数据库
+		// 每 5 分钟将内存中的用户数据保存到数据库
 		go s.userDataPersister()
 		// 每 60 秒检查并重置过期的配额
 		go s.quotaResetChecker()
@@ -729,10 +728,6 @@ func isConnectionError(err error) bool {
 // 返回:
 //   - int64: 复制的字节数
 //   - error: 复制过程中的错误
-func copyWithBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
-	// 调用标准库的 io.CopyBuffer 函数进行数据复制
-	return io.CopyBuffer(dst, src, buf)
-}
 
 // userDataPersister 定期将内存中的用户数据持久化到数据库（每 5 分钟）。
 // 该协程在后台运行，确保用户数据不会因服务器重启而丢失。
