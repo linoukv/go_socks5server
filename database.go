@@ -115,8 +115,8 @@ func (m *DatabaseManager) initTables() error {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,    -- 自增主键 ID
 			username TEXT UNIQUE NOT NULL,           -- 用户名，唯一且不能为空
 			password TEXT NOT NULL,                  -- bcrypt 加密的密码哈希，不能为空
-			read_speed_limit INTEGER DEFAULT 0,      -- 上传速度限制（字节/秒），默认 0 表示不限速
-			write_speed_limit INTEGER DEFAULT 0,     -- 下载速度限制（字节/秒），默认 0 表示不限速
+			upload_rate INTEGER DEFAULT 0,           -- 上传速度限制（字节/秒），默认 0 表示不限速
+			download_rate INTEGER DEFAULT 0,         -- 下载速度限制（字节/秒），默认 0 表示不限速
 			max_connections INTEGER DEFAULT 0,       -- 最大并发连接数，默认 0 表示不限制
 			max_ip_connections INTEGER DEFAULT 0,    -- 单 IP 最大连接数，默认 0 表示不限制
 			enabled BOOLEAN DEFAULT 1,               -- 是否启用，默认 1（启用）
@@ -453,12 +453,14 @@ func (m *DatabaseManager) SaveUser(user *User) error {
 		// 定义 UPSERT 语句：插入新记录或在冲突时更新
 		query := `
 			INSERT INTO users (username, password,
-				max_connections, max_ip_connections, enabled, upload_total, download_total, 
+				upload_rate, download_rate, max_connections, max_ip_connections, enabled, upload_total, download_total, 
 				create_time, last_activity, quota_period, quota_bytes, quota_used, quota_reset_time,
 				quota_start_time, quota_end_time)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(username) DO UPDATE SET
 				password = excluded.password,
+				upload_rate = excluded.upload_rate,
+				download_rate = excluded.download_rate,
 				max_connections = excluded.max_connections,
 				max_ip_connections = excluded.max_ip_connections,
 				enabled = excluded.enabled,
@@ -478,6 +480,8 @@ func (m *DatabaseManager) SaveUser(user *User) error {
 		_, err := m.db.Exec(query,
 			user.Username,
 			user.Password,
+			user.UploadRate,
+			user.DownloadRate,
 			user.MaxConnections,
 			user.MaxIPConnections,
 			user.Enabled,
@@ -513,7 +517,7 @@ func (m *DatabaseManager) GetUser(username string) (*User, error) {
 	// 定义查询语句
 	query := `
 		SELECT username, password,
-			max_connections, max_ip_connections, enabled, upload_total, download_total,
+			upload_rate, download_rate, max_connections, max_ip_connections, enabled, upload_total, download_total,
 			create_time, last_activity, quota_period, quota_bytes, quota_used, quota_reset_time,
 			quota_start_time, quota_end_time
 		FROM users
@@ -526,6 +530,8 @@ func (m *DatabaseManager) GetUser(username string) (*User, error) {
 	err := m.db.QueryRow(query, username).Scan(
 		&user.Username,
 		&user.Password,
+		&user.UploadRate,
+		&user.DownloadRate,
 		&user.MaxConnections,
 		&user.MaxIPConnections,
 		&user.Enabled,
@@ -561,7 +567,7 @@ func (m *DatabaseManager) GetAllUsers() ([]*User, error) {
 	// 定义查询语句，按用户名排序
 	query := `
 		SELECT username, password,
-			max_connections, max_ip_connections, enabled, upload_total, download_total,
+			upload_rate, download_rate, max_connections, max_ip_connections, enabled, upload_total, download_total,
 			create_time, last_activity, quota_period, quota_bytes, quota_used, quota_reset_time,
 			quota_start_time, quota_end_time
 		FROM users
@@ -586,6 +592,8 @@ func (m *DatabaseManager) GetAllUsers() ([]*User, error) {
 		err := rows.Scan(
 			&user.Username,
 			&user.Password,
+			&user.UploadRate,
+			&user.DownloadRate,
 			&user.MaxConnections,
 			&user.MaxIPConnections,
 			&user.Enabled,

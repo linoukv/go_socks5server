@@ -423,9 +423,12 @@ async function loadUsers() {
             console.log('处理用户:', user);
             const tr = document.createElement('tr');
             tr.innerHTML = `
+                <td><input type="checkbox" class="user-checkbox" value="${user.username || ''}" onchange="updateSelectedUsers()"></td>
                 <td>${user.username || '未知'}</td>
                 <td>${user.max_connections || '∞'}</td>
                 <td>${user.max_ip_connections || '∞'}</td>
+                <td>${formatRate(user.upload_rate)}</td>
+                <td>${formatRate(user.download_rate)}</td>
                 <td>${user.enabled ? '✅' : '❌'}</td>
                 <td>
                     <button class="btn" onclick="editUser('${user.username || ''}')">编辑</button>
@@ -449,13 +452,24 @@ document.getElementById('addUserForm').onsubmit = async function(e) {
     
     const editUsername = document.getElementById('editUsername').value;
     const isEdit = editUsername !== '';
+    const username = document.getElementById('username').value;
     
     try {
         const userData = {
-            username: document.getElementById('username').value,
+            username: username,
             max_conn: parseInt(document.getElementById('maxConn').value) || 0,
             max_ip_connections: parseInt(document.getElementById('maxIPConnections').value) || 0
         };
+        
+        // 获取限速设置
+        const uploadRateValue = parseFloat(document.getElementById('uploadRate').value) || 0;
+        const downloadRateValue = parseFloat(document.getElementById('downloadRate').value) || 0;
+        const uploadRateUnit = parseInt(document.getElementById('uploadRateUnit').value) || 1048576;
+        const downloadRateUnit = parseInt(document.getElementById('downloadRateUnit').value) || 1048576;
+        
+        // 计算字节/秒
+        const uploadRate = Math.floor(uploadRateValue * uploadRateUnit);
+        const downloadRate = Math.floor(downloadRateValue * downloadRateUnit);
         
         // 如果是编辑且密码不为空，才包含密码
         const password = document.getElementById('password').value;
@@ -482,6 +496,7 @@ document.getElementById('addUserForm').onsubmit = async function(e) {
         }
         
         console.log('提交用户数据:', userData);
+        console.log('限速设置:', { uploadRate, downloadRate });
         console.log('是否为编辑模式:', isEdit);
         
         if (isEdit) {
@@ -506,6 +521,20 @@ document.getElementById('addUserForm').onsubmit = async function(e) {
             }
             
             console.log('用户信息已更新');
+            
+            // 更新限速设置
+            await apiFetch(API_BASE + '/admin/set-rate-limit', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Auth-Token': authToken
+                },
+                body: JSON.stringify({
+                    usernames: [editUsername],
+                    uploadRate: uploadRate,
+                    downloadRate: downloadRate
+                })
+            });
         } else {
             // 创建用户
             // 新用户必须有密码，且需要校验
@@ -538,6 +567,20 @@ document.getElementById('addUserForm').onsubmit = async function(e) {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(userData)
+            });
+            
+            // 设置限速
+            await apiFetch(API_BASE + '/admin/set-rate-limit', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Auth-Token': authToken
+                },
+                body: JSON.stringify({
+                    usernames: [username],
+                    uploadRate: uploadRate,
+                    downloadRate: downloadRate
+                })
             });
         }
         
@@ -603,6 +646,10 @@ function resetUserForm() {
     document.getElementById('password').value = '';
     document.getElementById('maxConn').value = 0;
     document.getElementById('maxIPConnections').value = 0;
+    document.getElementById('uploadRate').value = '0';
+    document.getElementById('downloadRate').value = '0';
+    document.getElementById('uploadRateUnit').value = '1048576';
+    document.getElementById('downloadRateUnit').value = '1048576';
     document.getElementById('userModalTitle').textContent = '添加用户';
 }
 
@@ -630,6 +677,34 @@ async function editUser(username) {
         document.getElementById('password').value = '';
         document.getElementById('maxConn').value = user.max_connections || 0;
         document.getElementById('maxIPConnections').value = user.max_ip_connections || 0;
+        
+        // 填充限速设置
+        const uploadRate = user.upload_rate || 0;
+        const downloadRate = user.download_rate || 0;
+        
+        // 设置上传限速
+        if (uploadRate >= 1048576) {
+            document.getElementById('uploadRate').value = (uploadRate / 1048576).toFixed(2);
+            document.getElementById('uploadRateUnit').value = '1048576';
+        } else if (uploadRate >= 1024) {
+            document.getElementById('uploadRate').value = (uploadRate / 1024).toFixed(2);
+            document.getElementById('uploadRateUnit').value = '1024';
+        } else {
+            document.getElementById('uploadRate').value = 0;
+            document.getElementById('uploadRateUnit').value = '1048576'; // 默认为 MB/s
+        }
+        
+        // 设置下载限速
+        if (downloadRate >= 1048576) {
+            document.getElementById('downloadRate').value = (downloadRate / 1048576).toFixed(2);
+            document.getElementById('downloadRateUnit').value = '1048576';
+        } else if (downloadRate >= 1024) {
+            document.getElementById('downloadRate').value = (downloadRate / 1024).toFixed(2);
+            document.getElementById('downloadRateUnit').value = '1024';
+        } else {
+            document.getElementById('downloadRate').value = 0;
+            document.getElementById('downloadRateUnit').value = '1048576'; // 默认为 MB/s
+        }
         
         // 修改标题
         document.getElementById('userModalTitle').textContent = '编辑用户';
@@ -851,5 +926,184 @@ async function saveConfig() {
         // 恢复提交状态和按钮
         setSubmitting(false);
         setButtonDisabled('#configModal button[type="button"], #configModal .btn-primary', false);
+    }
+}
+
+// ==================== 限速管理功能 ====================
+
+// 已选择的用户列表
+let selectedUsersForRateLimit = [];
+
+// 格式化速率显示
+function formatRate(bytesPerSecond) {
+    if (!bytesPerSecond || bytesPerSecond === 0) {
+        return '不限速';
+    }
+    
+    const KB = 1024;
+    const MB = 1024 * KB;
+    const GB = 1024 * MB;
+    
+    if (bytesPerSecond >= GB) {
+        return (bytesPerSecond / GB).toFixed(2) + ' GB/s';
+    } else if (bytesPerSecond >= MB) {
+        return (bytesPerSecond / MB).toFixed(2) + ' MB/s';
+    } else if (bytesPerSecond >= KB) {
+        return (bytesPerSecond / KB).toFixed(2) + ' KB/s';
+    } else {
+        return bytesPerSecond + ' B/s';
+    }
+}
+
+// 全选/取消全选用户
+function toggleSelectAllUsers() {
+    const selectAllCheckbox = document.getElementById('selectAllUsers');
+    const userCheckboxes = document.querySelectorAll('.user-checkbox');
+    
+    userCheckboxes.forEach(checkbox => {
+        checkbox.checked = selectAllCheckbox.checked;
+    });
+    
+    updateSelectedUsers();
+}
+
+// 更新已选择的用户列表
+function updateSelectedUsers() {
+    const userCheckboxes = document.querySelectorAll('.user-checkbox:checked');
+    selectedUsersForRateLimit = Array.from(userCheckboxes).map(cb => cb.value);
+    
+    console.log('已选择的用户:', selectedUsersForRateLimit);
+}
+
+// 显示限速设置模态框
+function showRateLimitModal() {
+    // 检查是否选择了用户
+    if (selectedUsersForRateLimit.length === 0) {
+        alert('请先选择要设置限速的用户');
+        return;
+    }
+    
+    // 显示已选择的用户
+    const usersDiv = document.getElementById('rateLimitSelectedUsers');
+    usersDiv.innerHTML = selectedUsersForRateLimit.map(username => 
+        `<span style="display: inline-block; background: #3498db; color: white; padding: 2px 8px; margin: 2px; border-radius: 4px; font-size: 12px;">${username}</span>`
+    ).join('');
+    
+    // 重置表单
+    document.getElementById('uploadRate').value = '0';
+    document.getElementById('downloadRate').value = '0';
+    document.getElementById('uploadRateUnit').value = '1048576';
+    document.getElementById('downloadRateUnit').value = '1048576';
+    document.getElementById('rateLimitMessage').innerHTML = '';
+    
+    showModal('rateLimitModal');
+}
+
+// 保存限速设置
+async function saveRateLimit() {
+    const msgDiv = document.getElementById('rateLimitMessage');
+    
+    // 获取限速值
+    const uploadRateValue = parseFloat(document.getElementById('uploadRate').value) || 0;
+    const downloadRateValue = parseFloat(document.getElementById('downloadRate').value) || 0;
+    const uploadRateUnit = parseInt(document.getElementById('uploadRateUnit').value) || 1048576;
+    const downloadRateUnit = parseInt(document.getElementById('downloadRateUnit').value) || 1048576;
+    
+    // 计算字节/秒
+    const uploadRate = Math.floor(uploadRateValue * uploadRateUnit);
+    const downloadRate = Math.floor(downloadRateValue * downloadRateUnit);
+    
+    // 验证输入
+    if (uploadRate < 0 || downloadRate < 0) {
+        msgDiv.innerHTML = '<div style="color: #e74c3c; padding: 10px;">❌ 限速值不能为负数</div>';
+        return;
+    }
+    
+    // 显示加载状态
+    msgDiv.innerHTML = '<div style="color: #3498db; padding: 10px;">⏳ 正在保存...</div>';
+    
+    try {
+        const res = await apiFetch(API_BASE + '/admin/set-rate-limit', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Auth-Token': authToken
+            },
+            body: JSON.stringify({
+                usernames: selectedUsersForRateLimit,
+                uploadRate: uploadRate,
+                downloadRate: downloadRate
+            })
+        });
+        
+        const data = await res.json();
+        
+        if (data.success) {
+            msgDiv.innerHTML = `<div style="color: #27ae60; padding: 10px;">✅ ${data.message}</div>`;
+            
+            // 延迟关闭模态框并刷新用户列表
+            setTimeout(() => {
+                closeModal('rateLimitModal');
+                loadUsers(); // 刷新用户列表以显示新的限速设置
+                
+                // 清除选择
+                selectedUsersForRateLimit = [];
+                document.getElementById('selectAllUsers').checked = false;
+                document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = false);
+            }, 1500);
+        } else {
+            msgDiv.innerHTML = `<div style="color: #e74c3c; padding: 10px;">❌ ${data.message || '设置失败'}</div>`;
+        }
+    } catch (err) {
+        console.error('保存限速设置失败:', err);
+        msgDiv.innerHTML = '<div style="color: #e74c3c; padding: 10px;">❌ 网络错误，请稍后重试</div>';
+    }
+}
+
+// 显示重启服务器模态框
+function showRestartModal() {
+    document.getElementById('restartMessage').innerHTML = '';
+    showModal('restartModal');
+}
+
+// 重启服务器
+async function restartServer() {
+    const msgDiv = document.getElementById('restartMessage');
+    
+    // 显示加载状态
+    msgDiv.innerHTML = '<div style="color: #3498db; padding: 10px;">⏳ 正在重启服务器...</div>';
+    
+    try {
+        const res = await apiFetch(API_BASE + '/admin/restart', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Auth-Token': authToken
+            }
+        });
+        
+        const data = await res.json();
+        
+        if (data.status === 'success') {
+            msgDiv.innerHTML = `<div style="color: #27ae60; padding: 10px;">✅ ${data.message}</div>`;
+            
+            // 延迟关闭模态框
+            setTimeout(() => {
+                closeModal('restartModal');
+                
+                // 提示用户服务器正在重启
+                alert('服务器正在重启，请稍候...');
+                
+                // 重新加载页面
+                setTimeout(() => {
+                    window.location.reload();
+                }, 3000);
+            }, 2000);
+        } else {
+            msgDiv.innerHTML = `<div style="color: #e74c3c; padding: 10px;">❌ ${data.error || '重启失败'}</div>`;
+        }
+    } catch (err) {
+        console.error('重启服务器失败:', err);
+        msgDiv.innerHTML = '<div style="color: #e74c3c; padding: 10px;">❌ 网络错误，请稍后重试</div>';
     }
 }

@@ -218,6 +218,11 @@ type User struct {
 	QuotaEndTime   int64  `json:"quota_end_time"`   // 自定义配额结束时间（Unix 时间戳），仅在 QuotaPeriod="custom" 时有效
 	QuotaResetTime int64  `json:"quota_reset_time"` // 配额下次重置时间（Unix 时间戳），预留字段，用于周期性配额管理
 
+	// === 速率限制 ===
+	// 控制用户的上传和下载速率
+	UploadRate   int64 `json:"upload_rate"`   // 上传限速（字节/秒），0 表示不限速
+	DownloadRate int64 `json:"download_rate"` // 下载限速（字节/秒），0 表示不限速
+
 	// === 基本信息 ===
 	// 用户的身份标识和认证凭据
 	Username string `json:"username"` // 用户名，唯一标识符，用于登录认证和数据库主键

@@ -16,23 +16,27 @@ import (
 	"math/big"      // 大整数运算，用于生成安全的随机数
 	"net/http"      // HTTP 客户端和服务器实现，处理 Web 请求
 	"os"            // 操作系统功能，获取环境变量等
-	"strconv"       // 字符串和基本类型转换，如字符串转整数
-	"strings"       // 字符串操作函数，如分割、比较、前缀判断
-	"sync"          // 同步原语，提供互斥锁和读写锁
-	"sync/atomic"   // 原子操作，提供线程安全的整数操作
-	"time"          // 时间相关功能，处理时间戳和定时器
+	"os/exec"
+	"strconv"     // 字符串和基本类型转换，如字符串转整数
+	"strings"     // 字符串操作函数，如分割、比较、前缀判断
+	"sync"        // 同步原语，提供互斥锁和读写锁
+	"sync/atomic" // 原子操作，提供线程安全的整数操作
+	"time"        // 时间相关功能，处理时间戳和定时器
 
 	"golang.org/x/crypto/bcrypt" // bcrypt 密码哈希算法，安全地存储密码
 	"golang.org/x/time/rate"     // 速率限制器，基于令牌桶算法实现限流
 )
 
-// RateLimiter 基于 IP 的速率限制器，防止 API 滥用。
+// WebRateLimiter 基于 IP 的速率限制器，防止 API 滥用。
 // 使用 golang.org/x/time/rate 包实现令牌桶算法。
-type RateLimiter struct {
-	mu       sync.Mutex               // 保护 visitors map，确保并发安全
-	visitors map[string]*rate.Limiter // IP -> 限流器映射，每个 IP 独立的限流器
-	rate     rate.Limit               // 每秒允许的请求数（令牌生成速率）
-	burst    int                      // 允许的最大突发请求数（令牌桶容量）
+type WebRateLimiter struct {
+	mu           sync.Mutex               // 保护 visitors map，确保并发安全
+	visitors     map[string]*rate.Limiter // IP -> 限流器映射，每个 IP 独立的限流器
+	lastActivity map[string]int64         // IP -> 最后活动时间（Unix 时间戳）
+	rate         rate.Limit               // 每秒允许的请求数（令牌生成速率）
+	burst        int                      // 允许的最大突发请求数（令牌桶容量）
+	closeChan    chan struct{}            // 关闭通道
+	wg           sync.WaitGroup           // 等待组，确保清理协程正常退出
 }
 
 // AdminUser Web 管理员用户结构体。
@@ -62,27 +66,34 @@ type Session struct {
 	LastActivity int64  `json:"last_activity"` // 最后活动时间（用于空闲超时检测，30分钟无活动则失效）
 }
 
-// NewRateLimiter 创建一个新的速率限制器。
+// NewWebRateLimiter 创建一个新的速率限制器。
 //
 // 参数:
 //   - requestsPerSecond: 每秒允许的请求数
 //   - burst: 允许的最大突发请求数
 //
 // 返回:
-//   - *RateLimiter: 初始化后的限流器实例
-func NewRateLimiter(requestsPerSecond float64, burst int) *RateLimiter {
-	// 创建并返回一个新的速率限制器实例
-	return &RateLimiter{
-		visitors: make(map[string]*rate.Limiter), // 初始化空的访客映射表
-		rate:     rate.Limit(requestsPerSecond),  // 设置令牌生成速率（每秒允许的请求数）
-		burst:    burst,                          // 设置令牌桶容量（允许的最大突发请求数）
+//   - *WebRateLimiter: 初始化后的限流器实例
+func NewWebRateLimiter(requestsPerSecond float64, burst int) *WebRateLimiter {
+	rl := &WebRateLimiter{
+		visitors:     make(map[string]*rate.Limiter), // 初始化空的访客映射表
+		lastActivity: make(map[string]int64),         // 初始化最后活动时间映射表
+		rate:         rate.Limit(requestsPerSecond),  // 设置令牌生成速率（每秒允许的请求数）
+		burst:        burst,                          // 设置令牌桶容量（允许的最大突发请求数）
+		closeChan:    make(chan struct{}),            // 初始化关闭通道
 	}
+
+	// 启动定期清理协程
+	rl.wg.Add(1)
+	go rl.cleanupInactiveVisitors()
+
+	return rl
 }
 
 // getLimiter 获取或创建指定 IP 的限流器。
 // 使用互斥锁保证并发安全，每个 IP 有独立的限流器实例。
 // 如果该 IP 首次访问，会创建一个新的令牌桶限流器。
-func (rl *RateLimiter) getLimiter(ip string) *rate.Limiter {
+func (rl *WebRateLimiter) getLimiter(ip string) *rate.Limiter {
 	rl.mu.Lock()         // 获取互斥锁，保证并发安全
 	defer rl.mu.Unlock() // 函数返回时释放锁
 
@@ -93,21 +104,71 @@ func (rl *RateLimiter) getLimiter(ip string) *rate.Limiter {
 		rl.visitors[ip] = limiter                    // 将新限流器存入映射表
 	}
 
+	// 更新最后活动时间
+	rl.lastActivity[ip] = time.Now().Unix()
+
 	return limiter // 返回该 IP 对应的限流器
 }
 
 // Allow 检查指定 IP 是否允许发起请求。
 // 基于令牌桶算法，如果桶中有可用令牌则允许请求并消耗一个令牌。
 // 返回 true 表示允许请求，false 表示请求被限流。
-func (rl *RateLimiter) Allow(ip string) bool {
+func (rl *WebRateLimiter) Allow(ip string) bool {
 	// 获取该 IP 的限流器并检查是否允许请求
 	return rl.getLimiter(ip).Allow() // 调用令牌桶的 Allow 方法，返回是否有可用令牌
+}
+
+// cleanupInactiveVisitors 定期清理不活跃的访客限流器。
+// 每 10 分钟运行一次，清理超过 30 分钟未活动的访客。
+func (rl *WebRateLimiter) cleanupInactiveVisitors() {
+	defer rl.wg.Done()
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			rl.cleanupVisitors()
+		case <-rl.closeChan:
+			return
+		}
+	}
+}
+
+// cleanupVisitors 执行实际的访客清理操作。
+func (rl *WebRateLimiter) cleanupVisitors() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now().Unix()
+	inactiveThreshold := now - 30*60 // 30 分钟不活跃
+
+	for ip, lastActive := range rl.lastActivity {
+		if lastActive < inactiveThreshold {
+			delete(rl.visitors, ip)
+			delete(rl.lastActivity, ip)
+		}
+	}
+}
+
+// Close 关闭速率限制器，停止清理协程。
+func (rl *WebRateLimiter) Close() {
+	close(rl.closeChan)
+	rl.wg.Wait()
+
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	// 清空映射表
+	rl.visitors = make(map[string]*rate.Limiter)
+	rl.lastActivity = make(map[string]int64)
 }
 
 // Middleware HTTP 中间件，自动应用速率限制。
 // 拦截所有通过此中间件的请求，检查客户端 IP 的请求频率。
 // 如果超过限制，返回 HTTP 429 (Too Many Requests) 错误。
-func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
+func (rl *WebRateLimiter) Middleware(next http.Handler) http.Handler {
 	// 返回一个 HTTP 处理器函数，包装原始处理器并应用速率限制
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := r.RemoteAddr // 获取客户端 IP 地址（包含端口号）
@@ -208,6 +269,7 @@ func NewWebServer(auth *PasswordAuth, db *DatabaseManager, socksServer *Server, 
 	mux.HandleFunc("/api/user-quota", ws.handleUserQuota)                // 用户配额设置接口
 	mux.HandleFunc("/api/quota/stats", ws.handleQuotaStats)              // 配额统计接口
 	mux.HandleFunc("/api/admin/batch-set-quota", ws.handleBatchSetQuota) // 批量设置配额接口
+	mux.HandleFunc("/api/admin/set-rate-limit", ws.handleSetRateLimit)   // 批量设置限速接口
 
 	// API 路由：管理员认证
 	mux.HandleFunc("/api/admin/login", ws.handleAdminLogin)               // 管理员登录接口
@@ -239,6 +301,14 @@ func NewWebServer(auth *PasswordAuth, db *DatabaseManager, socksServer *Server, 
 			http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed) // 返回 405 错误
 		}
 	})
+	// 服务器重启路由
+	mux.HandleFunc("/api/admin/restart", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, `{"error":"方法不允许"}`, http.StatusMethodNotAllowed) // 返回 405 错误
+			return
+		}
+		ws.handleRestartServer(w, r) // 处理服务器重启请求
+	})
 
 	// 静态文件服务
 	// 优先使用嵌入的静态文件系统，如果不存在则使用本地 static 目录
@@ -258,16 +328,16 @@ func NewWebServer(auth *PasswordAuth, db *DatabaseManager, socksServer *Server, 
 
 	// 创建速率限制器（每秒 10 请求，突发 20）
 	// 用于防止 API 滥用和 DDoS 攻击
-	rateLimiter := NewRateLimiter(10.0, 20) // 创建限流器，每秒允许 10 个请求，突发容量 20
+	webRateLimiter := NewWebRateLimiter(10.0, 20) // 创建限流器，每秒允许 10 个请求，突发容量 20
 
 	// 创建 HTTP 服务器，应用中间件链
 	// 中间件执行顺序：安全头 -> CORS -> 认证 -> 速率限制
 	ws.server = &http.Server{
-		Addr:           listenAddr,                                                                            // 监听地址（如 ":8080"）
-		Handler:        rateLimiter.Middleware(ws.authMiddleware(ws.corsMiddleware(setSecurityHeaders(mux)))), // 中间件链：安全头、CORS、认证、限流
-		ReadTimeout:    10 * time.Second,                                                                      // 读取超时：防止慢速连接攻击（Slowloris）
-		WriteTimeout:   10 * time.Second,                                                                      // 写入超时：防止响应过慢导致资源占用
-		MaxHeaderBytes: 1 << 20,                                                                               // 最大请求头大小：1MB（1 << 20 = 1048576 字节）
+		Addr:           listenAddr,                                                                               // 监听地址（如 ":8080"）
+		Handler:        webRateLimiter.Middleware(ws.authMiddleware(ws.corsMiddleware(setSecurityHeaders(mux)))), // 中间件链：安全头、CORS、认证、限流
+		ReadTimeout:    10 * time.Second,                                                                         // 读取超时：防止慢速连接攻击（Slowloris）
+		WriteTimeout:   10 * time.Second,                                                                         // 写入超时：防止响应过慢导致资源占用
+		MaxHeaderBytes: 1 << 20,                                                                                  // 最大请求头大小：1MB（1 << 20 = 1048576 字节）
 	}
 
 	// 启动定期清理任务
@@ -1284,6 +1354,105 @@ func parseTimeString(timeStr string) (int64, error) {
 
 	// 所有格式都失败，返回错误
 	return 0, fmt.Errorf("无法解析时间格式：%s (支持时间戳、RFC3339、ISO8601 等格式)", timeStr)
+}
+
+// handleSetRateLimit 处理批量设置用户限速的 API 请求。
+// 支持为多个用户同时设置上传和下载限速。
+//
+// 请求方法: POST
+// 请求路径: /api/admin/set-rate-limit
+//
+//	请求体: {
+//	    "usernames": ["user1", "user2"],
+//	    "uploadRate": 1048576,    // 上传限速（字节/秒），0 表示不限速
+//	    "downloadRate": 2097152   // 下载限速（字节/秒），0 表示不限速
+//	}
+func (ws *WebServer) handleSetRateLimit(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	if r.Method != "POST" {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+
+	token := r.Header.Get("X-Auth-Token")
+	if token == "" {
+		http.Error(w, "未授权访问", http.StatusUnauthorized)
+		return
+	}
+
+	_, valid := ws.validateSession(token)
+	if !valid {
+		http.Error(w, "未授权访问", http.StatusUnauthorized)
+		return
+	}
+
+	// 定义请求数据结构体
+	var req struct {
+		Usernames    []string `json:"usernames"`    // 要设置限速的用户名列表
+		UploadRate   int64    `json:"uploadRate"`   // 上传限速（字节/秒），0 表示不限速
+		DownloadRate int64    `json:"downloadRate"` // 下载限速（字节/秒），0 表示不限速
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("解析限速设置数据失败：%v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Usernames) == 0 {
+		http.Error(w, "未选择用户", http.StatusBadRequest)
+		return
+	}
+
+	// 验证限速值不能为负数
+	if req.UploadRate < 0 || req.DownloadRate < 0 {
+		http.Error(w, "限速值不能为负数", http.StatusBadRequest)
+		return
+	}
+
+	updatedCount := 0
+
+	for _, username := range req.Usernames {
+		if username == "" {
+			continue
+		}
+
+		// 获取用户并更新限速配置
+		if user, exists := ws.auth.GetUser(username); exists {
+			// 更新用户限速字段
+			user.UploadRate = req.UploadRate
+			user.DownloadRate = req.DownloadRate
+
+			// 保存到数据库
+			if ws.db != nil {
+				if err := ws.db.SaveUser(user); err != nil {
+					log.Printf("保存用户 [%s] 限速配置失败: %v", username, err)
+					continue
+				}
+			}
+
+			// 更新内存中的限速器（如果服务器正在运行）
+			if ws.socksServer != nil && ws.socksServer.rateLimiterManager != nil {
+				ws.socksServer.rateLimiterManager.UpdateLimiter(username, req.UploadRate, req.DownloadRate)
+			}
+
+			updatedCount++
+			log.Printf("用户 [%s] 限速已更新：上传 %s/s, 下载 %s/s",
+				username,
+				formatBytes(req.UploadRate),
+				formatBytes(req.DownloadRate))
+		}
+	}
+
+	// 构建响应
+	response := map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("已成功为 %d 个用户设置限速", updatedCount),
+		"updated": updatedCount,
+	}
+
+	json.NewEncoder(w).Encode(response)
 }
 
 // initDefaultAdmin 初始化默认管理员账户（admin / password123）。
@@ -2526,4 +2695,73 @@ func getEnv(key, defaultValue string) string {
 		return defaultValue // 返回默认值
 	}
 	return value // 返回环境变量的值
+}
+
+// handleRestartServer 处理服务器重启请求。
+// 验证管理员会话后，启动一个协程来重启服务器。
+// 立即返回成功响应，因为重启过程可能需要一些时间。
+//
+// 参数:
+//   - w: HTTP 响应写入器
+//   - r: HTTP 请求对象
+func (ws *WebServer) handleRestartServer(w http.ResponseWriter, r *http.Request) {
+	// 提取认证 Token
+	token := r.Header.Get("X-Auth-Token")
+	if token == "" {
+		log.Printf("[安全] handleRestartServer 未授权访问尝试：%s", r.RemoteAddr)
+		http.Error(w, `{"error":"未授权访问","code":"UNAUTHORIZED"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// 验证会话令牌
+	session, valid := ws.validateSession(token)
+	if !valid {
+		log.Printf("[安全] handleRestartServer 无效 token：IP=%s", r.RemoteAddr)
+		http.Error(w, `{"error":"会话已过期","code":"SESSION_EXPIRED"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// 记录重启请求
+	log.Printf("[审计] 服务器重启请求：管理员 [%s], IP=%s", session.Username, r.RemoteAddr)
+
+	// 立即返回成功响应
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"success","message":"服务器正在重启，请稍候..."}`)
+
+	// 启动协程执行重启操作
+	go func() {
+		// 延迟 1 秒执行，确保响应已经发送
+		time.Sleep(1 * time.Second)
+
+		// 停止 Web 服务器
+		if err := ws.Stop(); err != nil {
+			log.Printf("停止 Web 服务器失败：%v", err)
+		}
+
+		// 停止 SOCKS5 服务器
+		if ws.socksServer != nil {
+			if err := ws.socksServer.Stop(); err != nil {
+				log.Printf("停止 SOCKS5 服务器失败：%v", err)
+			}
+		}
+
+		// 重启应用（通过重新启动进程实现）
+		log.Println("重启应用...")
+
+		// 获取当前可执行文件路径
+		execPath, err := os.Executable()
+		if err != nil {
+			log.Printf("获取可执行文件路径失败：%v", err)
+			return
+		}
+
+		// 启动新进程
+		if err := exec.Command(execPath).Start(); err != nil {
+			log.Printf("启动新进程失败：%v", err)
+			return
+		}
+
+		// 退出当前进程
+		os.Exit(0)
+	}()
 }

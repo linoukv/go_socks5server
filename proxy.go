@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"     // 导入上下文包，用于限速等待的取消信号
 	"fmt"         // 导入格式化包，用于字符串格式化和地址拼接
 	"io"          // 导入输入输出包，提供 CopyBuffer 等数据复制工具
 	"log"         // 导入日志包，用于记录运行日志和错误信息
@@ -224,6 +225,7 @@ func (p *TCPProxy) copyWithStats(dst, src net.Conn, upload bool) {
 	var needUserTraffic bool
 	var auth *PasswordAuth
 	var username string
+	var userRateLimiter *UserRateLimiter
 
 	if p.server != nil && p.server.config != nil {
 		// 尝试将认证器转换为 PasswordAuth
@@ -231,6 +233,16 @@ func (p *TCPProxy) copyWithStats(dst, src net.Conn, upload bool) {
 			auth = a
 			username = p.username
 			needUserTraffic = (auth != nil && username != "")
+			// 获取用户限速器
+			if needUserTraffic && p.server.rateLimiterManager != nil {
+				if user, exists := auth.GetUser(username); exists {
+					userRateLimiter = p.server.rateLimiterManager.GetOrCreateLimiter(
+						username,
+						user.UploadRate,
+						user.DownloadRate,
+					)
+				}
+			}
 		}
 	}
 
@@ -252,8 +264,7 @@ func (p *TCPProxy) copyWithStats(dst, src net.Conn, upload bool) {
 		return
 	}
 
-	// 完整路径：需要所有功能（统计+用户流量）
-	//log.Printf("[DEBUG] 使用完整统计路径（包含用户流量）")
+	// 完整路径：需要所有功能（统计+用户流量+限速）
 	// 定义批量持久化的阈值和超时参数
 	const batchThreshold int64 = 512 * 1024     // 批量提交阈值：512KB
 	const flushThreshold int64 = 64 * 1024      // 刷新阈值：64KB
@@ -274,14 +285,37 @@ func (p *TCPProxy) copyWithStats(dst, src net.Conn, upload bool) {
 
 	readTimeout := 300 * time.Second // 读取超时：300秒（5分钟）
 
+	// 检查连接是否已关闭
+	if src == nil || dst == nil {
+		return
+	}
+
 	// 主循环：持续读取和转发数据
 	for {
+		// 检查是否已关闭
+		if atomic.LoadInt32(&p.closed) != 0 {
+			return
+		}
+
 		// 设置读取超时，防止连接挂起
 		src.SetReadDeadline(time.Now().Add(readTimeout))
 
 		// 从源连接读取数据到缓冲区
 		n, err := src.Read(buf)
 		if n > 0 {
+			// 限速检查：如果需要限速，等待令牌
+			if userRateLimiter != nil {
+				if upload {
+					if err := userRateLimiter.WaitUpload(context.Background(), n); err != nil {
+						return // 限速等待被取消，退出
+					}
+				} else {
+					if err := userRateLimiter.WaitDownload(context.Background(), n); err != nil {
+						return // 限速等待被取消，退出
+					}
+				}
+			}
+
 			// 如果有数据可读，写入目标连接
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
 				return // 写入失败，退出循环
@@ -512,6 +546,12 @@ func (p *TCPProxy) Close() {
 		// 设置关闭标志
 		atomic.StoreInt32(&p.closed, 1)
 
+		// 保存客户端IP用于后续清理
+		var clientIP string
+		if p.clientConn != nil {
+			clientIP = p.clientConn.RemoteAddr().String()
+		}
+
 		// 关闭客户端连接
 		if p.clientConn != nil {
 			p.clientConn.Close()
@@ -528,8 +568,7 @@ func (p *TCPProxy) Close() {
 			// 减少用户连接计数
 			p.authCache.DecrementUserConnection(p.username)
 			// 移除用户的 IP 记录
-			if p.clientConn != nil {
-				clientIP := p.clientConn.RemoteAddr().String()
+			if clientIP != "" {
 				p.authCache.RemoveUserIP(p.username, clientIP)
 			}
 			// 连接关闭时保存最终的流量数据到数据库
@@ -870,9 +909,13 @@ func (u *UDPAssociation) readFromRemoteAndRespond(remoteConn *net.UDPConn, dstAd
 		}
 
 		// 发送响应给客户端
-		_, writeErr := u.udpListener.WriteToUDP(respData, clientAddr)
-		if writeErr != nil {
-			break // 发送失败，退出
+		if u.udpListener != nil {
+			_, writeErr := u.udpListener.WriteToUDP(respData, clientAddr)
+			if writeErr != nil {
+				break // 发送失败，退出
+			}
+		} else {
+			break // UDP监听器已关闭，退出
 		}
 
 		// 统计下载流量

@@ -38,7 +38,7 @@
         
         .user-info { display: flex; justify-content: space-between; align-items: center; background: #f8f9fa; padding: 10px 20px; border-radius: 8px; margin-bottom: 20px; }
         .user-info span { color: #666; }
-        .logout-btn { background: #e74c3c; padding: 5px 15px; font-size: 14px; }
+        .logout-btn { background: #e74c3c; }
         
         /* 模态框优化样式 */
         .modal-footer { margin-top: 20px; padding-top: 20px; border-top: 2px solid #eee; text-align: right; }
@@ -76,6 +76,7 @@
                     <button class="btn btn-warning" onclick="showChangePasswordModal()">🔑 修改密码</button>
                     <button class="btn btn-warning" onclick="showAuthMethodModal()">🔐 认证方式</button>
                     <button class="btn btn-warning" onclick="showConfigModal()">⚙️ 服务器配置</button>
+                    <button class="btn btn-danger logout-btn" onclick="showRestartModal()">🔄 重启服务器</button>
                     <button class="btn btn-danger logout-btn" onclick="logout()">🚪 退出登录</button>
                 </div>
             </div>
@@ -114,13 +115,17 @@
             <div class="card">
                 <h2>👥 用户管理 
                     <button class="btn btn-success" onclick="showAddUserModal()">添加用户</button>
+                    <button class="btn btn-warning" onclick="showRateLimitModal()">🚦 批量限速</button>
                 </h2>
                 <table id="usersTable">
                     <thead>
                         <tr>
+                            <th><input type="checkbox" id="selectAllUsers" onclick="toggleSelectAllUsers()"></th>
                             <th>用户名</th>
                             <th>连接数</th>
                             <th>最大登录设备</th>
+                            <th>上传限速</th>
+                            <th>下载限速</th>
                             <th>状态</th>
                             <th>操作</th>
                         </tr>
@@ -154,6 +159,28 @@
                 <div class="form-group">
                     <label>单用户最大登录设备 (0 不限)</label>
                     <input type="number" id="maxIPConnections" value="0">
+                </div>
+                <div class="form-group">
+                    <label>上传限速 (0 不限)</label>
+                    <div style="display: flex; gap: 10px;">
+                        <input type="number" id="uploadRate" value="0" min="0" style="flex: 1;" placeholder="0">
+                        <select id="uploadRateUnit" style="width: 100px;">
+                            <option value="1024">KB/s</option>
+                            <option value="1048576" selected>MB/s</option>
+                        </select>
+                    </div>
+                    <small style="color: #666;">0 表示不限速</small>
+                </div>
+                <div class="form-group">
+                    <label>下载限速 (0 不限)</label>
+                    <div style="display: flex; gap: 10px;">
+                        <input type="number" id="downloadRate" value="0" min="0" style="flex: 1;" placeholder="0">
+                        <select id="downloadRateUnit" style="width: 100px;">
+                            <option value="1024">KB/s</option>
+                            <option value="1048576" selected>MB/s</option>
+                        </select>
+                    </div>
+                    <small style="color: #666;">0 表示不限速</small>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn" onclick="closeModal('addUserModal')">取消</button>
@@ -294,6 +321,66 @@
                     <button type="button" class="btn btn-success" onclick="saveConfig()">保存配置</button>
                 </div>
             </form>
+        </div>
+    </div>
+    
+    <!-- 限速设置模态框 -->
+    <div id="rateLimitModal" class="modal">
+        <div class="modal-content" style="max-width: 500px;">
+            <span class="close" onclick="closeModal('rateLimitModal')">&times;</span>
+            <h2 style="margin-bottom: 20px;">🚦 用户限速设置</h2>
+            <form id="rateLimitForm">
+                <div class="form-group">
+                    <label>已选择的用户</label>
+                    <div id="rateLimitSelectedUsers" style="padding: 10px; background: #f8f9fa; border-radius: 4px; max-height: 100px; overflow-y: auto;">
+                        <span style="color: #999;">未选择用户</span>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>上传限速</label>
+                    <div style="display: flex; gap: 10px;">
+                        <input type="number" id="uploadRate" value="0" min="0" style="flex: 1;" placeholder="0">
+                        <select id="uploadRateUnit" style="width: 100px;">
+                            <option value="1024">KB/s</option>
+                            <option value="1048576" selected>MB/s</option>
+                        </select>
+                    </div>
+                    <small style="color: #666;">0 表示不限速</small>
+                </div>
+                <div class="form-group">
+                    <label>下载限速</label>
+                    <div style="display: flex; gap: 10px;">
+                        <input type="number" id="downloadRate" value="0" min="0" style="flex: 1;" placeholder="0">
+                        <select id="downloadRateUnit" style="width: 100px;">
+                            <option value="1024">KB/s</option>
+                            <option value="1048576" selected>MB/s</option>
+                        </select>
+                    </div>
+                    <small style="color: #666;">0 表示不限速</small>
+                </div>
+                <div id="rateLimitMessage" style="margin-top: 15px;"></div>
+                <div class="modal-footer" style="margin-top: 20px;">
+                    <button type="button" class="btn" onclick="closeModal('rateLimitModal')">取消</button>
+                    <button type="button" class="btn btn-success" onclick="saveRateLimit()">保存设置</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- 重启服务器模态框 -->
+    <div id="restartModal" class="modal">
+        <div class="modal-content" style="max-width: 500px;">
+            <span class="close" onclick="closeModal('restartModal')">&times;</span>
+            <h2 style="margin-bottom: 20px;">🔄 重启服务器</h2>
+            <div style="padding: 20px; background: #f8f9fa; border-radius: 8px; margin-bottom: 20px;">
+                <p style="font-size: 16px; margin-bottom: 10px;">⚠️ 重启服务器将中断所有当前连接，确认要继续吗？</p>
+                <p style="color: #666;">重启过程可能需要几秒钟时间，完成后服务器将自动重新启动。</p>
+            </div>
+            <div id="restartMessage" style="margin-top: 15px;"></div>
+            <div class="modal-footer" style="margin-top: 20px;">
+                <button type="button" class="btn" onclick="closeModal('restartModal')">取消</button>
+                <button type="button" class="btn btn-danger" onclick="restartServer()">确认重启</button>
+            </div>
         </div>
     </div>
     

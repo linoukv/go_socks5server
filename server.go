@@ -83,6 +83,8 @@ type Server struct {
 
 	connUserMap map[string]string // 连接地址到用户名的映射表，key 为远程地址字符串，value 为用户名，用于追踪哪个连接属于哪个用户
 	connUserMu  sync.RWMutex      // connUserMap 的读写锁，保证并发访问映射表时的线程安全
+
+	rateLimiterManager *RateLimiterManager // 用户限速器管理器，实现用户级别的上传/下载限速
 }
 
 // NewServer 创建一个新的 SOCKS5 服务器实例。
@@ -111,15 +113,16 @@ func NewServer(config *Config) *Server {
 
 	// 创建并返回 Server 实例，初始化所有成员变量
 	return &Server{
-		config:      config,                              // 保存配置引用
-		pool:        NewWorkerPool(config.MaxWorkers),    // 创建工作协程池，根据配置的最大工作数
-		connManager: NewConnManager(config.MaxConnPerIP), // 创建连接管理器，设置单 IP 最大连接数
-		stats:       NewStats(),                          // 创建统计信息收集器
-		bufferPool:  recvBufferPool,                      // 设置缓冲区池
-		ctx:         ctx,                                 // 保存上下文对象
-		cancel:      cancel,                              // 保存取消函数
-		zeroBuf:     make([]byte, 512),                   // 初始化 512 字节的零值缓冲区
-		connUserMap: make(map[string]string),             // 初始化连接-用户映射表
+		config:             config,                              // 保存配置引用
+		pool:               NewWorkerPool(config.MaxWorkers),    // 创建工作协程池，根据配置的最大工作数
+		connManager:        NewConnManager(config.MaxConnPerIP), // 创建连接管理器，设置单 IP 最大连接数
+		stats:              NewStats(),                          // 创建统计信息收集器
+		bufferPool:         recvBufferPool,                      // 设置缓冲区池
+		ctx:                ctx,                                 // 保存上下文对象
+		cancel:             cancel,                              // 保存取消函数
+		zeroBuf:            make([]byte, 512),                   // 初始化 512 字节的零值缓冲区
+		connUserMap:        make(map[string]string),             // 初始化连接-用户映射表
+		rateLimiterManager: NewRateLimiterManager(),             // 初始化限速器管理器
 	}
 }
 
@@ -233,6 +236,7 @@ func (s *Server) Start() error {
 
 // Stop 停止服务器，关闭监听器并等待所有连接处理完成。
 // 该方法会优雅地关闭服务器，确保正在处理的连接能够完成。
+// 支持超时机制，在等待 30 秒后强制关闭。
 //
 // 返回:
 //   - error: 停止错误，如服务器未运行等
@@ -252,8 +256,25 @@ func (s *Server) Stop() error {
 
 	// 停止工作池，不再接受新的任务
 	s.pool.Stop()
-	// 等待所有正在处理的连接协程结束
-	s.wg.Wait()
+	// 等待所有正在处理的连接协程结束，最多等待 30 秒
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// 正常完成
+	case <-time.After(30 * time.Second):
+		// 超时，强制继续关闭流程
+		log.Println("[警告] 服务器关闭超时，强制关闭剩余资源")
+	}
+
+	// 清理限速器管理器，释放内存
+	if s.rateLimiterManager != nil {
+		s.rateLimiterManager.Close()
+	}
 
 	// 输出服务器已停止的日志
 	log.Println("SOCKS5 服务器已停止")
